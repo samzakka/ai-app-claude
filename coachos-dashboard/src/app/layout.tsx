@@ -1,34 +1,27 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import Sidebar from "@/components/Sidebar";
+import AppShell from "@/components/AppShell";
+import { createServerSupabaseClient } from "@/lib/supabase-server";
 
 export const metadata: Metadata = {
   title: "CoachOS",
   description: "Coach dashboard",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const supabase = await createServerSupabaseClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
   return (
     <html lang="en">
       <body>
-        <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
-          <Sidebar />
-          <main
-            style={{
-              marginLeft: "200px",
-              flex: 1,
-              overflowY: "auto",
-              background: "#f9fafb",
-              minHeight: "100vh",
-            }}
-          >
-            {children}
-          </main>
-        </div>
+        <AppShell userEmail={user?.email ?? null}>{children}</AppShell>
       </body>
     </html>
   );

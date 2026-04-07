@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
+import { useState } from "react";
+import { supabase } from "@/lib/supabase";
 
 interface NavItem {
   label: string;
@@ -42,12 +44,41 @@ const sections: NavSection[] = [
   },
 ];
 
-export default function Sidebar() {
+function getCoachLabel(email: string | null) {
+  return email ?? "Coach";
+}
+
+function getCoachInitials(email: string | null) {
+  if (!email) return "C";
+
+  const [localPart] = email.split("@");
+  const cleaned = localPart.replace(/[^a-zA-Z0-9]/g, "");
+
+  return cleaned.slice(0, 2).toUpperCase() || "C";
+}
+
+export default function Sidebar({ userEmail }: { userEmail: string | null }) {
   const pathname = usePathname();
+  const router = useRouter();
+  const [signingOut, setSigningOut] = useState(false);
 
   const isActive = (href: string) => {
     if (href === "/") return pathname === "/";
     return pathname.startsWith(href);
+  };
+
+  const handleSignOut = async () => {
+    setSigningOut(true);
+    const { error } = await supabase.auth.signOut();
+
+    if (error) {
+      console.error("Error signing out:", error);
+      setSigningOut(false);
+      return;
+    }
+
+    router.replace("/login");
+    router.refresh();
   };
 
   return (
@@ -171,12 +202,43 @@ export default function Sidebar() {
             flexShrink: 0,
           }}
         >
-          CJ
+          {getCoachInitials(userEmail)}
         </div>
-        <div>
-          <div style={{ fontSize: "12px", fontWeight: 500, color: "#111827" }}>Coach Jordan</div>
-          <div style={{ fontSize: "10px", color: "#9ca3af" }}>Pro plan</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div
+            style={{
+              fontSize: "12px",
+              fontWeight: 500,
+              color: "#111827",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {getCoachLabel(userEmail)}
+          </div>
+          <div style={{ fontSize: "10px", color: "#9ca3af" }}>Authenticated</div>
         </div>
+      </div>
+
+      <div style={{ padding: "0 16px 16px" }}>
+        <button
+          onClick={handleSignOut}
+          disabled={signingOut}
+          style={{
+            width: "100%",
+            fontSize: "12px",
+            fontWeight: 500,
+            color: signingOut ? "#9ca3af" : "#6b7280",
+            border: "0.5px solid #e5e7eb",
+            background: "#fff",
+            padding: "8px 12px",
+            borderRadius: "8px",
+            cursor: signingOut ? "not-allowed" : "pointer",
+          }}
+        >
+          {signingOut ? "Signing out..." : "Sign Out"}
+        </button>
       </div>
     </aside>
   );
