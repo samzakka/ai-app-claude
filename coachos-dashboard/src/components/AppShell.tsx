@@ -11,9 +11,25 @@ export default function AppShell({
   userEmail: string | null
 }>) {
   const pathname = usePathname()
+  const isPublicRoute = pathname === '/login' || pathname.startsWith('/check-in/')
+  const isClientRoute = pathname.startsWith('/client/')
 
-  if (pathname === '/login') {
+  if (isPublicRoute) {
     return <>{children}</>
+  }
+
+  if (isClientRoute) {
+    return (
+      <main
+        style={{
+          minHeight: '100vh',
+          overflowY: 'auto',
+          background: '#f4f1ea',
+        }}
+      >
+        {children}
+      </main>
+    )
   }
 
   return (

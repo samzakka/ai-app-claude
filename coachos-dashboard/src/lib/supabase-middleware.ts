@@ -14,6 +14,8 @@ export async function updateSession(request: NextRequest) {
   let response = NextResponse.next({
     request,
   })
+  const isPublicCheckInRoute = request.nextUrl.pathname.startsWith('/check-in/')
+  const isLoginRoute = request.nextUrl.pathname === '/login'
 
   const supabase = createServerClient(supabaseUrl, supabaseAnonKey, {
     cookies: {
@@ -40,7 +42,7 @@ export async function updateSession(request: NextRequest) {
     data: { user },
   } = await supabase.auth.getUser()
 
-  if (!user && request.nextUrl.pathname !== '/login') {
+  if (!user && !isLoginRoute && !isPublicCheckInRoute) {
     const redirectUrl = request.nextUrl.clone()
     redirectUrl.pathname = '/login'
     const redirectResponse = NextResponse.redirect(redirectUrl)
@@ -48,7 +50,7 @@ export async function updateSession(request: NextRequest) {
     return redirectResponse
   }
 
-  if (user && request.nextUrl.pathname === '/login') {
+  if (user && isLoginRoute) {
     const redirectUrl = request.nextUrl.clone()
     redirectUrl.pathname = '/'
     const redirectResponse = NextResponse.redirect(redirectUrl)
