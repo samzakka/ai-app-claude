@@ -41,6 +41,11 @@ import {
   type WorkoutExerciseLog,
 } from '@/lib/workout-logs'
 import {
+  getLatestMessage,
+  getMessagePreviewText,
+  getOutgoingMessageStatusLabel,
+  getUnreadIncomingMessageIds,
+  getUnreadIncomingMessageCount,
   mergeClientMessage,
   normalizeClientMessage,
   normalizeClientMessages,
@@ -263,7 +268,7 @@ export default function ClientDashboardPage() {
           .order('exercise_order', { ascending: true }),
         supabase
           .from('messages')
-          .select('id, client_id, sender_type, content, created_at')
+          .select('id, created_at, coach_id, client_id, sender, message_type, content, media_url, media_duration_seconds, read, read_at, was_ai_drafted')
           .eq('client_id', clientId)
           .order('created_at', { ascending: true })
           .limit(200),
@@ -344,6 +349,35 @@ export default function ClientDashboardPage() {
     void fetchDashboard()
   }, [params.id, todayDate])
 
+  useEffect(() => {
+    async function markCoachMessagesAsRead() {
+      const unreadIds = getUnreadIncomingMessageIds(messages, 'client')
+
+      if (unreadIds.length === 0) return
+
+      const readAt = new Date().toISOString()
+      const { error } = await supabase
+        .from('messages')
+        .update({ read: true, read_at: readAt })
+        .in('id', unreadIds)
+
+      if (error) {
+        console.error('Error marking coach messages as read:', error)
+        return
+      }
+
+      setMessages((prev) =>
+        prev.map((message) => (
+          unreadIds.includes(message.id ?? '')
+            ? { ...message, read: true, read_at: readAt }
+            : message
+        )),
+      )
+    }
+
+    void markCoachMessagesAsRead()
+  }, [messages])
+
   const todayWorkout = useMemo(() => getTodayWorkout(workoutPlan), [workoutPlan])
   const todayWorkoutLogMap = useMemo(
     () => getWorkoutLogMapForDate(workoutLogs, todayDate),
@@ -382,6 +416,11 @@ export default function ClientDashboardPage() {
     ? getCheckInScheduleStatus(checkInSettings, latestSubmission?.submitted_at ?? null)
     : null
   const greeting = client ? getGreeting(client.full_name) : 'Good evening'
+  const unreadCoachMessageCount = getUnreadIncomingMessageCount(messages, 'client')
+  const latestThreadMessage = getLatestMessage(messages)
+  const latestThreadPreview = getMessagePreviewText(latestThreadMessage)
+  const latestClientMessage = [...messages].reverse().find((message) => message.sender === 'client') ?? null
+  const latestClientMessageKey = latestClientMessage ? (latestClientMessage.id ?? latestClientMessage.created_at) : null
   const activeWorkoutEntry = activeExerciseKey
     ? todayWorkout.entries.find((entry) => entry.exercise_key === activeExerciseKey) ?? null
     : null
@@ -616,22 +655,43 @@ export default function ClientDashboardPage() {
     setMessageError(null)
 
     const optimisticMessage: ClientMessage = {
+      coach_id: typeof client.coach_id === 'string' ? client.coach_id : null,
       client_id: client.id,
-      sender_type: 'client',
+      sender: 'client',
+      message_type: 'text',
       content,
+      media_url: null,
+      media_duration_seconds: null,
+      read: false,
+      read_at: null,
+      was_ai_drafted: false,
       created_at: new Date().toISOString(),
     }
 
     setMessages((prev) => mergeClientMessage(prev, optimisticMessage))
 
+    if (typeof client.coach_id !== 'string' || !client.coach_id) {
+      setMessageError('We could not determine the coach for this conversation.')
+      setMessages((prev) => prev.filter((entry) => entry !== optimisticMessage))
+      setMessageSending(false)
+      return
+    }
+
     const { data, error } = await supabase
       .from('messages')
       .insert({
+        coach_id: client.coach_id,
         client_id: client.id,
-        sender_type: 'client',
+        sender: 'client',
+        message_type: 'text',
         content,
+        media_url: null,
+        media_duration_seconds: null,
+        read: false,
+        read_at: null,
+        was_ai_drafted: false,
       })
-      .select('id, client_id, sender_type, content, created_at')
+      .select('id, created_at, coach_id, client_id, sender, message_type, content, media_url, media_duration_seconds, read, read_at, was_ai_drafted')
       .single()
 
     if (error) {
@@ -1410,7 +1470,52 @@ export default function ClientDashboardPage() {
             </section>
 
             <section style={cardStyle(isMobile ? '22px 18px' : '24px 24px')}>
-              <div style={{ ...labelStyle(), marginBottom: '14px' }}>Messages</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '14px' }}>
+                <div style={labelStyle()}>Messages</div>
+                {unreadCoachMessageCount > 0 && (
+                  <span
+                    style={{
+                      background: '#e0f2fe',
+                      color: '#0f4c81',
+                      fontSize: '10px',
+                      fontWeight: 600,
+                      padding: '2px 8px',
+                      borderRadius: '999px',
+                      marginBottom: '10px',
+                    }}
+                  >
+                    {unreadCoachMessageCount} new
+                  </span>
+                )}
+              </div>
+
+              {latestThreadMessage && (
+                <div
+                  style={{
+                    background: latestThreadMessage.sender === 'coach' && !latestThreadMessage.read ? '#eef6ff' : '#f8fafc',
+                    border: `1px solid ${latestThreadMessage.sender === 'coach' && !latestThreadMessage.read ? 'rgba(14, 116, 144, 0.18)' : 'rgba(148, 163, 184, 0.16)'}`,
+                    borderRadius: '18px',
+                    padding: '12px 14px',
+                    marginBottom: '12px',
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '4px' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 600, color: '#94a3b8', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                      Latest message
+                    </div>
+                    <div style={{ fontSize: '11px', color: '#94a3b8' }}>
+                      {formatMessageTimestamp(latestThreadMessage.created_at)}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '13px', color: '#475569', lineHeight: 1.6 }}>
+                    <span style={{ fontWeight: 600, color: '#111827' }}>
+                      {latestThreadMessage.sender === 'coach' ? 'Coach' : 'You'}:
+                    </span>{' '}
+                    {latestThreadPreview}
+                  </div>
+                </div>
+              )}
+
               <div
                 style={{
                   display: 'flex',
@@ -1440,9 +1545,9 @@ export default function ClientDashboardPage() {
                   </div>
                 ) : (
                   messages.map((message, index) => {
-                    const isClientMessage = message.sender_type === 'client'
+                    const isClientMessage = message.sender === 'client'
                     const showLabel =
-                      index === 0 || messages[index - 1]?.sender_type !== message.sender_type
+                      index === 0 || messages[index - 1]?.sender !== message.sender
 
                     return (
                       <div
@@ -1463,9 +1568,9 @@ export default function ClientDashboardPage() {
                             maxWidth: '88%',
                             borderRadius: '18px',
                             padding: '12px 14px',
-                            background: isClientMessage ? '#111827' : '#fbfbfa',
+                            background: isClientMessage ? '#111827' : message.read ? '#fbfbfa' : '#eef6ff',
                             color: isClientMessage ? '#fff' : '#374151',
-                            border: isClientMessage ? 'none' : `1px solid ${borderColor}`,
+                            border: isClientMessage ? 'none' : `1px solid ${message.read ? borderColor : 'rgba(14, 116, 144, 0.18)'}`,
                           }}
                         >
                           <div style={{ whiteSpace: 'pre-wrap', fontSize: '13px', lineHeight: 1.6 }}>
@@ -1479,6 +1584,12 @@ export default function ClientDashboardPage() {
                             }}
                           >
                             {formatMessageTimestamp(message.created_at)}
+                            {isClientMessage && (message.id ?? message.created_at) === latestClientMessageKey && (
+                              <> · {getOutgoingMessageStatusLabel(message, 'client')}</>
+                            )}
+                            {!isClientMessage && !message.read && (
+                              <> · New</>
+                            )}
                           </div>
                         </div>
                       </div>

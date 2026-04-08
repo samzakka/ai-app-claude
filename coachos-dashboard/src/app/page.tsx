@@ -1,15 +1,67 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
+import { supabase } from "@/lib/supabase";
+import {
+  buildCoachPerformanceSummary,
+  type CoachPerformanceSummary,
+} from "@/lib/client-performance-summary";
+import {
+  buildCoachContentIdeas,
+  type CoachContentIdea,
+} from "@/lib/coach-content-ideas";
+import {
+  buildCoachAttentionItem,
+  getAttentionSummaryLabel,
+  sortCoachAttentionItems,
+  type CoachAttentionItem,
+} from "@/lib/coach-attention";
+import {
+  createDefaultCheckInSettings,
+  normalizeCheckInSettings,
+  normalizeCheckInSubmissions,
+} from "@/lib/check-ins";
+import { normalizeWorkoutPlan, normalizeHabitPlan } from "@/lib/client-dashboard";
+import { getDateDaysAgo, normalizeHabitCompletionLogs } from "@/lib/habit-completions";
+import {
+  getLeadInitials,
+  getLeadStageLabel,
+  getLeadStageStyle,
+  normalizeLeadRecords,
+  type LeadRecord,
+} from "@/lib/leads";
 import {
   priorityItems,
-  leads,
   clients,
   metrics,
   opsInsights,
   type UrgencyLevel,
   type AgentType,
 } from "@/lib/mock-data";
+import { normalizeClientMessages } from "@/lib/messages";
+import { normalizeWorkoutExerciseLogs } from "@/lib/workout-logs";
+
+type DashboardClient = {
+  id: string;
+  full_name: string;
+  email?: string;
+  status: string;
+  created_at: string;
+} & Record<string, unknown>;
+
+type DashboardLead = {
+  id: string;
+  full_name: string;
+  email: string;
+  heat_score: string | null;
+  stage: string | null;
+  created_at: string;
+  goal: string | null;
+  budget_range: string | null;
+  timeline: string | null;
+  ai_brief: unknown;
+};
 
 function getGreeting() {
   const hour = new Date().getHours();
@@ -53,6 +105,35 @@ function getStatusStyle(status: string) {
   if (status === "review") return { bg: "#fef3c7", color: "#BA7517" };
   if (status === "on_track") return { bg: "#dcfce7", color: "#639922" };
   return { bg: "#f3f4f6", color: "#6b7280" };
+}
+
+function getPriorityStyle(priority: "high" | "medium" | "low") {
+  if (priority === "high") return { bg: "#fee2e2", color: "#A32D2D", border: "#fecaca", label: "High" };
+  if (priority === "medium") return { bg: "#fef3c7", color: "#BA7517", border: "#fde68a", label: "Medium" };
+  return { bg: "#e0f2fe", color: "#0f4c81", border: "#bae6fd", label: "Low" };
+}
+
+function getAttentionActionLabel(action: CoachAttentionItem["suggestedNextAction"]) {
+  if (action === "Review check-in") return "Review check-in";
+  if (action === "Send message") return "Send message";
+  if (action === "Adjust workout plan") return "Adjust plan";
+  return "Open client";
+}
+
+function getAttentionActionHref(item: CoachAttentionItem) {
+  if (item.suggestedNextAction === "Review check-in") {
+    return `/clients/${item.clientId}#check-in-summary`;
+  }
+
+  if (item.suggestedNextAction === "Send message") {
+    return `/clients/${item.clientId}#messages`;
+  }
+
+  if (item.suggestedNextAction === "Adjust workout plan") {
+    return `/clients/${item.clientId}#weekly-adjustment`;
+  }
+
+  return `/clients/${item.clientId}`;
 }
 
 function StatusPill({ status, label }: { status: string; label: string }) {
@@ -110,16 +191,222 @@ function Avatar({ initials, size = 32 }: { initials: string; size?: number }) {
 }
 
 export default function HomePage() {
-  const totalActions = priorityItems.length;
+  const [attentionItems, setAttentionItems] = useState<CoachAttentionItem[]>([]);
+  const [attentionLoading, setAttentionLoading] = useState(true);
+  const [attentionError, setAttentionError] = useState<string | null>(null);
+  const [dashboardLeads, setDashboardLeads] = useState<LeadRecord[]>([]);
+  const [contentIdeas, setContentIdeas] = useState<CoachContentIdea[]>([]);
+  const [contentIdeasLoading, setContentIdeasLoading] = useState(true);
+  const [contentIdeasError, setContentIdeasError] = useState<string | null>(null);
+  const [contentIdeasSourceSummary, setContentIdeasSourceSummary] = useState("Reviewing leads, client conversations, and check-ins...");
+  const [contentIdeasUsedFallback, setContentIdeasUsedFallback] = useState(false);
   const today = new Date().toLocaleDateString("en-US", {
     weekday: "long",
     month: "long",
     day: "numeric",
   });
+  const visibleAttentionItems = attentionItems.slice(0, 5);
+  const attentionSummary = getAttentionSummaryLabel(attentionItems);
+  const visibleContentIdeas = contentIdeas.slice(0, 3);
 
-  const newLeads = leads.slice(0, 3);
+  const newLeads = dashboardLeads.slice(0, 3);
+  const newLeadCount = dashboardLeads.filter((lead) => lead.stage === "new").length;
   const alertClients = clients.filter((c) => c.status !== "on_track").slice(0, 3);
   const todayCheckIns = clients.filter((c) => c.checkIns[0]?.date === "March 30").slice(0, 3);
+
+  useEffect(() => {
+    async function fetchAttentionQueue() {
+      setAttentionLoading(true);
+      setAttentionError(null);
+      setContentIdeasLoading(true);
+      setContentIdeasError(null);
+
+      const workoutLookback = getDateDaysAgo(45);
+      const habitLookback = getDateDaysAgo(45);
+      const messageLookback = new Date(Date.now() - 45 * 86400000).toISOString();
+
+      const [
+        { data: clientRows, error: clientError },
+        { data: planRows, error: planError },
+        { data: checkInSettingRows, error: checkInSettingError },
+        { data: checkInSubmissionRows, error: checkInSubmissionError },
+        { data: workoutLogRows, error: workoutLogError },
+        { data: habitLogRows, error: habitLogError },
+        { data: messageRows, error: messageError },
+        { data: leadRows, error: leadError },
+      ] = await Promise.all([
+        supabase
+          .from("clients")
+          .select("*")
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("client_plans")
+          .select("client_id, type, content, updated_at"),
+        supabase
+          .from("client_check_in_settings")
+          .select("id, client_id, frequency, due_day, custom_interval_weeks, schedule_anchor_date, public_access_token, field_config, created_at, updated_at"),
+        supabase
+          .from("client_check_in_submissions")
+          .select("id, client_id, check_in_settings_id, due_date, submitted_at, content, field_config_snapshot")
+          .order("submitted_at", { ascending: false }),
+        supabase
+          .from("client_workout_exercise_logs")
+          .select("id, client_id, workout_date, workout_day, exercise_key, exercise_order, exercise_name, target_sets, target_reps, prescribed_notes, selected_substitution, completed, completed_at, client_notes, difficulty_rpe, logged_weight, logged_reps, created_at, updated_at")
+          .gte("workout_date", workoutLookback)
+          .order("workout_date", { ascending: false }),
+        supabase
+          .from("client_habit_completion_logs")
+          .select("id, client_id, date, habit_key, habit_name, completed, completed_at, created_at, updated_at")
+          .gte("date", habitLookback)
+          .order("date", { ascending: false }),
+        supabase
+          .from("messages")
+          .select("id, created_at, coach_id, client_id, sender, message_type, content, media_url, media_duration_seconds, read, read_at, was_ai_drafted")
+          .gte("created_at", messageLookback)
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("leads")
+          .select("id, full_name, email, coach_id, heat_score, goal, budget_range, timeline, ai_brief, stage, coach_notes, follow_up_date, last_contacted_at, stage_updated_at, converted_client_id, converted_at, created_at")
+          .order("created_at", { ascending: false })
+          .limit(100),
+      ]);
+
+      const firstError =
+        clientError ||
+        planError ||
+        checkInSettingError ||
+        checkInSubmissionError ||
+        workoutLogError ||
+        habitLogError ||
+        messageError;
+
+      if (firstError) {
+        console.error("Error loading coach attention data:", firstError);
+        setAttentionError("Unable to load the attention queue right now.");
+        setAttentionItems([]);
+        setAttentionLoading(false);
+        setContentIdeas([]);
+        setContentIdeasError("Unable to load content ideas right now.");
+        setContentIdeasLoading(false);
+        return;
+      }
+
+      const clientsData = (clientRows ?? []) as DashboardClient[];
+      const planData = planRows ?? [];
+      const checkInSettingsByClient = new Map<string, ReturnType<typeof normalizeCheckInSettings>>();
+      const workoutPlanByClient = new Map<string, unknown>();
+      const habitPlanByClient = new Map<string, unknown>();
+
+      planData.forEach((row) => {
+        if (row.type === "workout") {
+          workoutPlanByClient.set(row.client_id, row.content);
+        }
+
+        if (row.type === "habits") {
+          habitPlanByClient.set(row.client_id, row.content);
+        }
+      });
+
+      (checkInSettingRows ?? []).forEach((row) => {
+        if (typeof row.client_id === "string") {
+          checkInSettingsByClient.set(row.client_id, normalizeCheckInSettings(row));
+        }
+      });
+
+      const submissions = normalizeCheckInSubmissions(checkInSubmissionRows ?? []);
+      const workoutLogs = normalizeWorkoutExerciseLogs(workoutLogRows ?? []);
+      const habitLogs = normalizeHabitCompletionLogs(habitLogRows ?? []);
+      const messages = normalizeClientMessages(messageRows ?? []);
+
+      const submissionsByClient = new Map<string, typeof submissions>();
+      const workoutLogsByClient = new Map<string, typeof workoutLogs>();
+      const habitLogsByClient = new Map<string, typeof habitLogs>();
+      const messagesByClient = new Map<string, typeof messages>();
+      const performanceSummaries: CoachPerformanceSummary[] = [];
+
+      submissions.forEach((entry) => {
+        const current = submissionsByClient.get(entry.client_id) ?? [];
+        current.push(entry);
+        submissionsByClient.set(entry.client_id, current);
+      });
+
+      workoutLogs.forEach((entry) => {
+        const current = workoutLogsByClient.get(entry.client_id) ?? [];
+        current.push(entry);
+        workoutLogsByClient.set(entry.client_id, current);
+      });
+
+      habitLogs.forEach((entry) => {
+        const current = habitLogsByClient.get(entry.client_id) ?? [];
+        current.push(entry);
+        habitLogsByClient.set(entry.client_id, current);
+      });
+
+      messages.forEach((entry) => {
+        const current = messagesByClient.get(entry.client_id) ?? [];
+        current.push(entry);
+        messagesByClient.set(entry.client_id, current);
+      });
+
+      const nextAttentionItems = clientsData
+        .map((client) => {
+          const clientSubmissions = submissionsByClient.get(client.id) ?? [];
+          const clientWorkoutLogs = workoutLogsByClient.get(client.id) ?? [];
+          const clientHabitLogs = habitLogsByClient.get(client.id) ?? [];
+          const clientMessages = messagesByClient.get(client.id) ?? [];
+          const weeklyPlan = normalizeWorkoutPlan(workoutPlanByClient.get(client.id));
+          const habits = normalizeHabitPlan(habitPlanByClient.get(client.id));
+          const performanceSummary = buildCoachPerformanceSummary({
+            weeklyPlan,
+            habits,
+            workoutLogs: clientWorkoutLogs,
+            habitLogs: clientHabitLogs,
+            checkInSubmissions: clientSubmissions,
+          });
+          performanceSummaries.push(performanceSummary);
+
+          return buildCoachAttentionItem({
+            client,
+            checkInSettings: checkInSettingsByClient.get(client.id) ?? createDefaultCheckInSettings(`default-${client.id}`),
+            checkInSubmissions: clientSubmissions,
+            performanceSummary,
+            workoutLogs: clientWorkoutLogs,
+            habitLogs: clientHabitLogs,
+            messages: clientMessages,
+          });
+        })
+        .filter((item): item is CoachAttentionItem => item !== null);
+
+      setAttentionItems(sortCoachAttentionItems(nextAttentionItems));
+      setAttentionLoading(false);
+
+      if (leadError) {
+        console.error("Error loading lead data for content ideas:", leadError);
+        setDashboardLeads([]);
+      } else {
+        setDashboardLeads(normalizeLeadRecords((leadRows ?? []) as DashboardLead[]));
+      }
+
+      const contentIdeasResult = buildCoachContentIdeas({
+        leads: (leadRows ?? []) as DashboardLead[],
+        checkInSubmissions: submissions,
+        clientMessages: messages,
+        performanceSummaries,
+      });
+
+      setContentIdeas(contentIdeasResult.ideas);
+      setContentIdeasSourceSummary(contentIdeasResult.sourceSummary);
+      setContentIdeasUsedFallback(contentIdeasResult.usedFallback);
+      setContentIdeasError(
+        leadError && contentIdeasResult.ideas.length === 0
+          ? "Lead signals are unavailable right now, so content ideas are limited."
+          : null,
+      );
+      setContentIdeasLoading(false);
+    }
+
+    fetchAttentionQueue();
+  }, []);
 
   return (
     <div style={{ padding: "24px", maxWidth: "1100px" }}>
@@ -129,8 +416,340 @@ export default function HomePage() {
           {getGreeting()}, Coach Jordan
         </h1>
         <p style={{ margin: "2px 0 0", color: "#6b7280", fontSize: "13px" }}>
-          {today} · {totalActions} things need your attention today
+          {today} · {attentionLoading ? "Reviewing client signals..." : attentionSummary}
         </p>
+      </div>
+
+      <div
+        style={{
+          background: "#fff",
+          border: "0.5px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            marginBottom: "12px",
+          }}
+        >
+          <span
+            style={{
+              fontSize: "11px",
+              fontWeight: 500,
+              letterSpacing: "0.04em",
+              textTransform: "uppercase" as const,
+              color: "#6b7280",
+            }}
+          >
+            Needs Attention
+          </span>
+          <Link href="/clients" style={{ fontSize: "12px", color: "#7F77DD", textDecoration: "none" }}>
+            View clients
+          </Link>
+        </div>
+
+        {attentionLoading && (
+          <div style={{ fontSize: "13px", color: "#9ca3af" }}>
+            Reviewing recent check-ins, adherence, and client activity...
+          </div>
+        )}
+
+        {attentionError && !attentionLoading && (
+          <div
+            style={{
+              background: "#fee2e2",
+              color: "#A32D2D",
+              border: "1px solid #fecaca",
+              borderRadius: "8px",
+              padding: "10px 12px",
+              fontSize: "12px",
+            }}
+          >
+            {attentionError}
+          </div>
+        )}
+
+        {!attentionLoading && !attentionError && visibleAttentionItems.length === 0 && (
+          <div
+            style={{
+              background: "#f9fafb",
+              border: "0.5px solid #e5e7eb",
+              borderRadius: "10px",
+              padding: "16px",
+            }}
+          >
+            <div style={{ fontSize: "13px", fontWeight: 500, color: "#111827", marginBottom: "4px" }}>
+              No clients need attention right now.
+            </div>
+            <div style={{ fontSize: "12px", color: "#6b7280", lineHeight: 1.6 }}>
+              Recent check-ins, adherence, and activity look stable across your current client list.
+            </div>
+          </div>
+        )}
+
+        {!attentionLoading && !attentionError && visibleAttentionItems.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
+            {visibleAttentionItems.map((item) => {
+              const priorityStyle = getPriorityStyle(item.priority);
+              const actionLabel = getAttentionActionLabel(item.suggestedNextAction);
+              const actionHref = getAttentionActionHref(item);
+
+              return (
+                <div
+                  key={item.clientId}
+                  style={{
+                    background: "#fafafa",
+                    border: "0.5px solid #e5e7eb",
+                    borderRadius: "10px",
+                    padding: "12px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "12px" }}>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "6px" }}>
+                        <Link
+                          href={actionHref}
+                          style={{ fontSize: "13px", fontWeight: 600, color: "#111827", textDecoration: "none" }}
+                        >
+                          {item.clientName}
+                        </Link>
+                        <span
+                          style={{
+                            background: priorityStyle.bg,
+                            color: priorityStyle.color,
+                            border: `1px solid ${priorityStyle.border}`,
+                            fontSize: "10px",
+                            fontWeight: 600,
+                            padding: "2px 8px",
+                            borderRadius: "999px",
+                            textTransform: "uppercase",
+                            letterSpacing: "0.04em",
+                          }}
+                        >
+                          {priorityStyle.label}
+                        </span>
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: "4px", marginBottom: "6px" }}>
+                        {item.reasons.map((reason, index) => (
+                          <div key={`${item.clientId}-reason-${index}`} style={{ fontSize: "12px", color: "#374151", lineHeight: 1.5 }}>
+                            {reason}
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ fontSize: "11px", color: "#6b7280" }}>
+                        Next step: <span style={{ color: "#111827", fontWeight: 500 }}>{item.suggestedNextAction}</span>
+                      </div>
+                    </div>
+                    <Link
+                      href={actionHref}
+                      style={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        fontSize: "12px",
+                        fontWeight: 500,
+                        color: "#7F77DD",
+                        border: "0.5px solid #e5e7eb",
+                        background: "#fff",
+                        padding: "6px 12px",
+                        borderRadius: "8px",
+                        whiteSpace: "nowrap",
+                        textDecoration: "none",
+                      }}
+                    >
+                      {actionLabel}
+                    </Link>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      <div
+        style={{
+          background: "#fff",
+          border: "0.5px solid #e5e7eb",
+          borderRadius: "12px",
+          padding: "16px",
+          marginBottom: "16px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: "12px",
+            marginBottom: "12px",
+            flexWrap: "wrap",
+          }}
+        >
+          <div>
+            <div
+              style={{
+                fontSize: "11px",
+                fontWeight: 500,
+                letterSpacing: "0.04em",
+                textTransform: "uppercase" as const,
+                color: "#6b7280",
+                marginBottom: "4px",
+              }}
+            >
+              AI Content Coach
+            </div>
+            <div style={{ fontSize: "16px", fontWeight: 500, color: "#111827", marginBottom: "3px" }}>
+              What Your Audience Needs to Hear
+            </div>
+            <div style={{ fontSize: "12px", color: "#9ca3af", lineHeight: 1.5 }}>
+              {contentIdeasLoading ? "Reviewing recurring themes..." : contentIdeasSourceSummary}
+            </div>
+          </div>
+          <Link href="/content" style={{ fontSize: "12px", color: "#7F77DD", textDecoration: "none", whiteSpace: "nowrap" }}>
+            Open content agent
+          </Link>
+        </div>
+
+        {contentIdeasLoading && (
+          <div style={{ fontSize: "13px", color: "#9ca3af" }}>
+            Pulling repeated themes from leads, check-ins, messages, and adherence data...
+          </div>
+        )}
+
+        {contentIdeasError && !contentIdeasLoading && (
+          <div
+            style={{
+              background: "#fff7ed",
+              color: "#BA7517",
+              border: "1px solid #fed7aa",
+              borderRadius: "8px",
+              padding: "10px 12px",
+              fontSize: "12px",
+              marginBottom: visibleContentIdeas.length > 0 ? "12px" : 0,
+            }}
+          >
+            {contentIdeasError}
+          </div>
+        )}
+
+        {!contentIdeasLoading && visibleContentIdeas.length === 0 && (
+          <div
+            style={{
+              background: "#f9fafb",
+              border: "0.5px solid #e5e7eb",
+              borderRadius: "10px",
+              padding: "16px",
+            }}
+          >
+            <div style={{ fontSize: "13px", fontWeight: 500, color: "#111827", marginBottom: "4px" }}>
+              No strong recurring themes yet.
+            </div>
+            <div style={{ fontSize: "12px", color: "#6b7280", lineHeight: 1.6 }}>
+              As more leads, client conversations, and check-ins come in, this panel will surface clearer content angles instead of guessing.
+            </div>
+          </div>
+        )}
+
+        {!contentIdeasLoading && visibleContentIdeas.length > 0 && (
+          <>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+                gap: "10px",
+              }}
+            >
+              {visibleContentIdeas.map((idea) => (
+                <div
+                  key={idea.id}
+                  style={{
+                    background: "#fafafa",
+                    border: "0.5px solid #e5e7eb",
+                    borderRadius: "10px",
+                    padding: "14px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "10px", marginBottom: "8px" }}>
+                    <div style={{ fontSize: "14px", fontWeight: 600, color: "#111827", lineHeight: 1.4 }}>
+                      {idea.topic}
+                    </div>
+                    <span
+                      style={{
+                        background: idea.isFallback ? "#f3f4f6" : "#e0f2fe",
+                        color: idea.isFallback ? "#6b7280" : "#0f4c81",
+                        fontSize: "10px",
+                        fontWeight: 600,
+                        padding: "3px 8px",
+                        borderRadius: "999px",
+                        whiteSpace: "nowrap",
+                      }}
+                    >
+                      {idea.isFallback ? "Goal trend" : "Pattern"}
+                    </span>
+                  </div>
+
+                  <div
+                    style={{
+                      fontSize: "12px",
+                      fontWeight: 500,
+                      color: "#111827",
+                      lineHeight: 1.6,
+                      marginBottom: "8px",
+                    }}
+                  >
+                    {idea.hook}
+                  </div>
+
+                  <div style={{ fontSize: "12px", color: "#4b5563", lineHeight: 1.6, marginBottom: "10px" }}>
+                    {idea.whyItMatters}
+                  </div>
+
+                  {idea.scriptStarter && (
+                    <div
+                      style={{
+                        background: "#fff",
+                        border: "0.5px solid #e5e7eb",
+                        borderRadius: "8px",
+                        padding: "10px",
+                        marginBottom: "10px",
+                      }}
+                    >
+                      <div style={{ fontSize: "10px", fontWeight: 600, color: "#9ca3af", letterSpacing: "0.04em", textTransform: "uppercase", marginBottom: "4px" }}>
+                        Script starter
+                      </div>
+                      <div style={{ fontSize: "12px", color: "#374151", lineHeight: 1.5 }}>
+                        {idea.scriptStarter}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", flexDirection: "column", gap: "5px", marginBottom: "10px" }}>
+                    {idea.talkingPoints.slice(0, 2).map((point, index) => (
+                      <div key={`${idea.id}-point-${index}`} style={{ fontSize: "12px", color: "#374151", lineHeight: 1.5 }}>
+                        {point}
+                      </div>
+                    ))}
+                  </div>
+
+                  <div style={{ fontSize: "11px", color: "#9ca3af" }}>
+                    {idea.evidenceLabel}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {contentIdeasUsedFallback && (
+              <div style={{ fontSize: "11px", color: "#9ca3af", marginTop: "12px", lineHeight: 1.5 }}>
+                Some ideas are based on recurring goal trends because objection and pain-point patterns are still light.
+              </div>
+            )}
+          </>
+        )}
       </div>
 
       {/* Priority Queue */}
@@ -238,7 +857,7 @@ export default function HomePage() {
       >
         {[
           { label: "Active clients", value: metrics.activeClients, sub: null, href: "/clients", danger: false },
-          { label: "New leads", value: metrics.newLeadsWithBriefs, sub: "briefs ready", href: "/leads", danger: false },
+          { label: "New leads", value: newLeadCount, sub: "in pipeline", href: "/leads", danger: false },
           { label: "Check-ins due", value: metrics.checkInsDueToday, sub: "today", href: "/clients", danger: false },
           { label: "At-risk clients", value: metrics.atRiskClients, sub: null, href: "/retention", danger: metrics.atRiskClients > 0 },
         ].map((m) => (
@@ -277,26 +896,47 @@ export default function HomePage() {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px" }}>
         {/* New Leads */}
         <div style={{ background: "#fff", border: "0.5px solid #e5e7eb", borderRadius: "12px", padding: "16px" }}>
-          <div style={{ fontSize: "11px", fontWeight: 500, letterSpacing: "0.04em", textTransform: "uppercase" as const, color: "#6b7280", marginBottom: "12px" }}>
-            New leads
-          </div>
+        <div style={{ fontSize: "11px", fontWeight: 500, letterSpacing: "0.04em", textTransform: "uppercase" as const, color: "#6b7280", marginBottom: "12px" }}>
+          New leads
+        </div>
+        {newLeads.length === 0 ? (
+          <div style={{ fontSize: "13px", color: "#9ca3af" }}>No real leads in the pipeline yet.</div>
+        ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: "10px" }}>
-            {newLeads.map((lead) => (
+            {newLeads.map((lead) => {
+              const stageStyle = getLeadStageStyle(lead.stage)
+
+              return (
               <Link key={lead.id} href={`/leads/${lead.id}`} style={{ display: "flex", alignItems: "center", gap: "10px", textDecoration: "none" }}>
-                <Avatar initials={lead.initials} />
+                <Avatar initials={getLeadInitials(lead.full_name)} />
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: "13px", fontWeight: 500, color: "#111827" }}>{lead.name}</div>
+                  <div style={{ fontSize: "13px", fontWeight: 500, color: "#111827" }}>{lead.full_name}</div>
                   <div style={{ fontSize: "12px", color: "#9ca3af", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {lead.goal}
+                    {lead.goal ?? lead.email}
                   </div>
                 </div>
-                <StatusPill status={lead.status} label={lead.status.charAt(0).toUpperCase() + lead.status.slice(1)} />
+                <span
+                  style={{
+                    background: stageStyle.bg,
+                    color: stageStyle.color,
+                    border: `1px solid ${stageStyle.border}`,
+                    fontSize: "10px",
+                    fontWeight: 600,
+                    padding: "2px 8px",
+                    borderRadius: "999px",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {getLeadStageLabel(lead.stage)}
+                </span>
               </Link>
-            ))}
+              )
+            })}
           </div>
-          <Link href="/leads" style={{ display: "block", marginTop: "12px", fontSize: "12px", color: "#7F77DD", textDecoration: "none" }}>
-            View all leads →
-          </Link>
+        )}
+        <Link href="/leads" style={{ display: "block", marginTop: "12px", fontSize: "12px", color: "#7F77DD", textDecoration: "none" }}>
+          View all leads →
+        </Link>
         </div>
 
         {/* Client Alerts */}

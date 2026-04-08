@@ -7,6 +7,27 @@ import { buildCheckInAnalysis } from '@/lib/check-in-analysis'
 import { buildCoachPerformanceSummary } from '@/lib/client-performance-summary'
 import { type AICoachingAssistantSuggestion } from '@/lib/ai-coaching-assistant'
 import {
+  getAISuggestionHistorySummary,
+  getAISuggestionTypeLabel,
+  mergeAISuggestionHistoryEntry,
+  normalizeAISuggestionHistory,
+  normalizeAISuggestionHistoryEntry,
+  type AISuggestionHistoryEntry,
+  type AISuggestionType,
+} from '@/lib/ai-suggestion-history'
+import {
+  normalizeWorkoutPlannerWeeklyPlan,
+  type AIWorkoutAdjustmentDraft,
+  type AIWorkoutAdjustmentDecision,
+  type AIWorkoutPlannerDraft,
+  type WorkoutPlannerAssistanceLevel,
+} from '@/lib/ai-workout-planner'
+import {
+  getLatestMessage,
+  getMessagePreviewText,
+  getOutgoingMessageStatusLabel,
+  getUnreadIncomingMessageIds,
+  getUnreadIncomingMessageCount,
   mergeClientMessage,
   normalizeClientMessage,
   normalizeClientMessages,
@@ -72,7 +93,24 @@ type GeneratedAICoachingSuggestion = {
   suggestion: AICoachingAssistantSuggestion
   generatedAt: string
   model: string
+  historyId: string | null
 }
+
+type GeneratedAIWorkoutPlan = {
+  draft: AIWorkoutPlannerDraft
+  generatedAt: string
+  model: string
+  historyId: string | null
+}
+
+type GeneratedAIWorkoutAdjustment = {
+  draft: AIWorkoutAdjustmentDraft
+  generatedAt: string
+  model: string
+  historyId: string | null
+}
+
+type AIWorkoutPlanSource = 'planner' | 'adjustment' | null
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -130,6 +168,20 @@ const riskColors = {
   Medium: { bg: '#fef3c7', color: '#BA7517', border: '#BA7517' },
   High: { bg: '#fee2e2', color: '#A32D2D', border: '#A32D2D' },
 } as const
+
+const adjustmentDecisionColors: Record<
+  AIWorkoutAdjustmentDecision,
+  { bg: string; color: string; border: string; label: string }
+> = {
+  progress: { bg: '#dcfce7', color: '#166534', border: '#86efac', label: 'Progress' },
+  maintain: { bg: '#e0f2fe', color: '#0f4c81', border: '#7dd3fc', label: 'Maintain' },
+  reduce: { bg: '#fef3c7', color: '#92400e', border: '#fcd34d', label: 'Reduce' },
+  deload: { bg: '#fee2e2', color: '#991b1b', border: '#fca5a5', label: 'Deload' },
+}
+
+const sectionAnchorStyle: React.CSSProperties = {
+  scrollMarginTop: '20px',
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -245,6 +297,21 @@ function formatMessageTimestamp(value: string) {
   })
 }
 
+function extractClientContextValues(record: Record<string, unknown> | null, keys: string[]) {
+  if (!record) return []
+
+  return keys
+    .map((key) => record[key])
+    .flatMap((value) => {
+      if (typeof value === 'string') return [value.trim()]
+      if (Array.isArray(value)) {
+        return value.filter((entry): entry is string => typeof entry === 'string').map((entry) => entry.trim())
+      }
+      return []
+    })
+    .filter(Boolean)
+}
+
 // ─── Component ────────────────────────────────────────────────────────────────
 
 export default function ClientDetailPage() {
@@ -260,6 +327,17 @@ export default function ClientDetailPage() {
   const [workoutSaving, setWorkoutSaving] = useState(false)
   const [workoutSaved, setWorkoutSaved]   = useState(false)
   const [isMobile, setIsMobile]           = useState(false)
+  const [workoutPlannerLevel, setWorkoutPlannerLevel] = useState<WorkoutPlannerAssistanceLevel>('medium')
+  const [workoutPlannerLoading, setWorkoutPlannerLoading] = useState(false)
+  const [workoutPlannerError, setWorkoutPlannerError] = useState<string | null>(null)
+  const [generatedWorkoutPlan, setGeneratedWorkoutPlan] = useState<GeneratedAIWorkoutPlan | null>(null)
+  const [workoutAdjustmentLoading, setWorkoutAdjustmentLoading] = useState(false)
+  const [workoutAdjustmentError, setWorkoutAdjustmentError] = useState<string | null>(null)
+  const [generatedWorkoutAdjustment, setGeneratedWorkoutAdjustment] = useState<GeneratedAIWorkoutAdjustment | null>(null)
+  const [workoutAdjustmentApproved, setWorkoutAdjustmentApproved] = useState(false)
+  const [workoutPlanApproved, setWorkoutPlanApproved] = useState(false)
+  const [aiWorkoutPlanPendingApproval, setAiWorkoutPlanPendingApproval] = useState(false)
+  const [aiWorkoutPlanSource, setAiWorkoutPlanSource] = useState<AIWorkoutPlanSource>(null)
 
   // Nutrition plan
   const [planContent, setPlanContent] = useState<Record<TextPlanType, string>>({ nutrition: '' })
@@ -294,6 +372,11 @@ export default function ClientDetailPage() {
   const [messagesError, setMessagesError] = useState<string | null>(null)
   const [coachMessageDraft, setCoachMessageDraft] = useState('')
   const [coachMessageSending, setCoachMessageSending] = useState(false)
+  const [coachMessageWasAIDrafted, setCoachMessageWasAIDrafted] = useState(false)
+  const [coachUserId, setCoachUserId] = useState<string | null>(null)
+  const [aiHistory, setAiHistory] = useState<AISuggestionHistoryEntry[]>([])
+  const [aiHistoryLoading, setAiHistoryLoading] = useState(true)
+  const [aiHistoryError, setAiHistoryError] = useState<string | null>(null)
 
   const weekDates = getWeekDates()
 
@@ -308,6 +391,39 @@ export default function ClientDetailPage() {
 
     return () => window.removeEventListener('resize', syncViewport)
   }, [])
+
+  useEffect(() => {
+    async function fetchCoachUser() {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser()
+
+      setCoachUserId(user?.id ?? null)
+    }
+
+    fetchCoachUser()
+  }, [])
+
+  useEffect(() => {
+    function scrollToHashTarget() {
+      if (typeof window === 'undefined') return
+
+      const hash = window.location.hash.replace('#', '')
+      if (!hash) return
+
+      window.requestAnimationFrame(() => {
+        const element = document.getElementById(hash)
+        if (!element) return
+
+        element.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      })
+    }
+
+    scrollToHashTarget()
+    window.addEventListener('hashchange', scrollToHashTarget)
+
+    return () => window.removeEventListener('hashchange', scrollToHashTarget)
+  }, [loading])
 
   // ── Fetch client ────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -453,7 +569,7 @@ export default function ClientDetailPage() {
 
       const { data, error } = await supabase
         .from('messages')
-        .select('id, client_id, sender_type, content, created_at')
+        .select('id, created_at, coach_id, client_id, sender, message_type, content, media_url, media_duration_seconds, read, read_at, was_ai_drafted')
         .eq('client_id', params.id)
         .order('created_at', { ascending: true })
         .limit(200)
@@ -471,8 +587,138 @@ export default function ClientDetailPage() {
     fetchMessages()
   }, [params.id])
 
+  useEffect(() => {
+    async function fetchAISuggestionHistory() {
+      setAiHistoryLoading(true)
+      setAiHistoryError(null)
+
+      const { data, error } = await supabase
+        .from('ai_suggestion_history')
+        .select('id, client_id, suggestion_type, input_snapshot, output_snapshot, approved, approved_at, created_at')
+        .eq('client_id', params.id)
+        .order('created_at', { ascending: false })
+        .limit(12)
+
+      if (error) {
+        console.error('Error fetching AI suggestion history:', error)
+        setAiHistoryError('AI history is unavailable until the new table is set up.')
+      } else {
+        setAiHistory(normalizeAISuggestionHistory(data ?? []))
+      }
+
+      setAiHistoryLoading(false)
+    }
+
+    fetchAISuggestionHistory()
+  }, [params.id])
+
+  useEffect(() => {
+    async function markClientMessagesAsRead() {
+      const unreadIds = getUnreadIncomingMessageIds(messages, 'coach')
+
+      if (unreadIds.length === 0) return
+
+      const readAt = new Date().toISOString()
+      const { error } = await supabase
+        .from('messages')
+        .update({ read: true, read_at: readAt })
+        .in('id', unreadIds)
+
+      if (error) {
+        console.error('Error marking client messages as read:', error)
+        return
+      }
+
+      setMessages((prev) =>
+        prev.map((message) => (
+          unreadIds.includes(message.id ?? '')
+            ? { ...message, read: true, read_at: readAt }
+            : message
+        )),
+      )
+    }
+
+    markClientMessagesAsRead()
+  }, [messages])
+
+  async function storeAISuggestionHistory(
+    suggestionType: AISuggestionType,
+    inputSnapshot: Record<string, unknown>,
+    outputSnapshot: Record<string, unknown>,
+  ) {
+    const { data, error } = await supabase
+      .from('ai_suggestion_history')
+      .insert({
+        client_id: params.id,
+        suggestion_type: suggestionType,
+        input_snapshot: inputSnapshot,
+        output_snapshot: outputSnapshot,
+        approved: false,
+        approved_at: null,
+      })
+      .select('id, client_id, suggestion_type, input_snapshot, output_snapshot, approved, approved_at, created_at')
+      .single()
+
+    if (error) {
+      console.error('Error storing AI suggestion history:', error)
+      setAiHistoryError('This AI result was generated, but history could not be saved right now.')
+      return null
+    }
+
+    const nextEntry = normalizeAISuggestionHistoryEntry(data)
+
+    if (nextEntry) {
+      setAiHistory((prev) => mergeAISuggestionHistoryEntry(prev, nextEntry))
+      setAiHistoryError(null)
+    }
+
+    return nextEntry
+  }
+
+  async function updateAISuggestionHistoryApproval(
+    historyId: string | null,
+    approved: boolean,
+  ) {
+    if (!historyId) return
+
+    const approvedAt = approved ? new Date().toISOString() : null
+    const { data, error } = await supabase
+      .from('ai_suggestion_history')
+      .update({
+        approved,
+        approved_at: approvedAt,
+      })
+      .eq('id', historyId)
+      .select('id, client_id, suggestion_type, input_snapshot, output_snapshot, approved, approved_at, created_at')
+      .single()
+
+    if (error) {
+      console.error('Error updating AI suggestion approval:', error)
+      setAiHistoryError('Approval was updated locally, but history could not be refreshed yet.')
+      return
+    }
+
+    const nextEntry = normalizeAISuggestionHistoryEntry(data)
+
+    if (nextEntry) {
+      setAiHistory((prev) => mergeAISuggestionHistoryEntry(prev, nextEntry))
+      setAiHistoryError(null)
+    }
+  }
+
   // ── Workout plan handlers ────────────────────────────────────────────────────
   function addEntry(day: Day) {
+    if (aiWorkoutPlanPendingApproval) {
+      if (workoutPlanApproved) {
+        const historyId =
+          aiWorkoutPlanSource === 'planner'
+            ? generatedWorkoutPlan?.historyId ?? null
+            : generatedWorkoutAdjustment?.historyId ?? null
+        void updateAISuggestionHistoryApproval(historyId, false)
+      }
+      setWorkoutPlanApproved(false)
+    }
+
     setWeeklyPlan((prev) => ({
       ...prev,
       [day]: [...prev[day], { exercise: '', sets: '', reps: '', notes: '' }],
@@ -480,6 +726,17 @@ export default function ClientDetailPage() {
   }
 
   function removeEntry(day: Day, index: number) {
+    if (aiWorkoutPlanPendingApproval) {
+      if (workoutPlanApproved) {
+        const historyId =
+          aiWorkoutPlanSource === 'planner'
+            ? generatedWorkoutPlan?.historyId ?? null
+            : generatedWorkoutAdjustment?.historyId ?? null
+        void updateAISuggestionHistoryApproval(historyId, false)
+      }
+      setWorkoutPlanApproved(false)
+    }
+
     setWeeklyPlan((prev) => ({
       ...prev,
       [day]: prev[day].filter((_, i) => i !== index),
@@ -487,6 +744,17 @@ export default function ClientDetailPage() {
   }
 
   function updateEntry(day: Day, index: number, field: keyof WorkoutEntry, value: string) {
+    if (aiWorkoutPlanPendingApproval) {
+      if (workoutPlanApproved) {
+        const historyId =
+          aiWorkoutPlanSource === 'planner'
+            ? generatedWorkoutPlan?.historyId ?? null
+            : generatedWorkoutAdjustment?.historyId ?? null
+        void updateAISuggestionHistoryApproval(historyId, false)
+      }
+      setWorkoutPlanApproved(false)
+    }
+
     setWeeklyPlan((prev) => ({
       ...prev,
       [day]: prev[day].map((entry, i) => i === index ? { ...entry, [field]: value } : entry),
@@ -494,6 +762,8 @@ export default function ClientDetailPage() {
   }
 
   async function saveWorkoutPlan() {
+    if (aiWorkoutPlanPendingApproval && !workoutPlanApproved) return
+
     setWorkoutSaving(true)
     const { error } = await supabase
       .from('client_plans')
@@ -502,8 +772,150 @@ export default function ClientDetailPage() {
         { onConflict: 'client_id,type' }
       )
     if (error) { console.error('Error saving workout plan:', error); alert(`Failed to save: ${error.message}`) }
-    else { setWorkoutSaved(true); setTimeout(() => setWorkoutSaved(false), 3000) }
+    else {
+      setWorkoutSaved(true)
+      setAiWorkoutPlanPendingApproval(false)
+      setAiWorkoutPlanSource(null)
+      setWorkoutPlanApproved(false)
+      setTimeout(() => setWorkoutSaved(false), 3000)
+    }
     setWorkoutSaving(false)
+  }
+
+  async function generateAIWorkoutPlan() {
+    if (!client) return
+
+    setWorkoutPlannerLoading(true)
+    setWorkoutPlannerError(null)
+    setWorkoutPlanApproved(false)
+
+    try {
+      const plannerInput = {
+        mode: 'generate' as const,
+        client: {
+          id: client.id,
+          fullName: client.full_name,
+          status: client.status,
+          joinedAt: client.created_at,
+          goals: clientGoals,
+          notes: clientNotes,
+        },
+        assistanceLevel: workoutPlannerLevel,
+        currentWorkoutPlan: weeklyPlan,
+        performanceSummary,
+        checkInAnalysis,
+      }
+      const response = await fetch('/api/ai/workout-planner', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          input: plannerInput,
+        }),
+      })
+
+      const payload = await response.json().catch(() => null)
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? 'Unable to generate an AI workout plan right now.')
+      }
+
+      const nextDraft = payload as Omit<GeneratedAIWorkoutPlan, 'historyId'>
+      const historyEntry = await storeAISuggestionHistory(
+        'workout_generation',
+        plannerInput as unknown as Record<string, unknown>,
+        nextDraft as unknown as Record<string, unknown>,
+      )
+
+      setGeneratedWorkoutPlan({
+        ...nextDraft,
+        historyId: historyEntry?.id ?? null,
+      })
+      setWeeklyPlan(normalizeWorkoutPlannerWeeklyPlan(nextDraft.draft.weeklyPlan))
+      setAiWorkoutPlanPendingApproval(true)
+      setAiWorkoutPlanSource('planner')
+    } catch (plannerError) {
+      console.error('Error generating AI workout plan:', plannerError)
+      setWorkoutPlannerError(
+        plannerError instanceof Error
+          ? plannerError.message
+          : 'Unable to generate an AI workout plan right now.',
+      )
+    } finally {
+      setWorkoutPlannerLoading(false)
+    }
+  }
+
+  async function generateWeeklyAdjustment() {
+    if (!client) return
+
+    setWorkoutAdjustmentLoading(true)
+    setWorkoutAdjustmentError(null)
+    setWorkoutAdjustmentApproved(false)
+
+    try {
+      const plannerInput = {
+        mode: 'adjust' as const,
+        client: {
+          id: client.id,
+          fullName: client.full_name,
+          status: client.status,
+          joinedAt: client.created_at,
+          goals: clientGoals,
+          notes: clientNotes,
+        },
+        assistanceLevel: workoutPlannerLevel,
+        currentWorkoutPlan: weeklyPlan,
+        performanceSummary,
+        checkInAnalysis,
+      }
+      const response = await fetch('/api/ai/workout-planner', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          input: plannerInput,
+        }),
+      })
+
+      const payload = await response.json().catch(() => null)
+
+      if (!response.ok) {
+        throw new Error(payload?.error ?? 'Unable to generate a weekly adjustment right now.')
+      }
+
+      const nextDraft = payload as Omit<GeneratedAIWorkoutAdjustment, 'historyId'>
+      const historyEntry = await storeAISuggestionHistory(
+        'weekly_adjustment',
+        plannerInput as unknown as Record<string, unknown>,
+        nextDraft as unknown as Record<string, unknown>,
+      )
+      setGeneratedWorkoutAdjustment({
+        ...nextDraft,
+        historyId: historyEntry?.id ?? null,
+      })
+    } catch (adjustmentError) {
+      console.error('Error generating weekly adjustment:', adjustmentError)
+      setGeneratedWorkoutAdjustment(null)
+      setWorkoutAdjustmentError(
+        adjustmentError instanceof Error
+          ? adjustmentError.message
+          : 'Unable to generate a weekly adjustment right now.',
+      )
+    } finally {
+      setWorkoutAdjustmentLoading(false)
+    }
+  }
+
+  function applyWeeklyAdjustmentChanges() {
+    if (!generatedWorkoutAdjustment || !workoutAdjustmentApproved) return
+
+    setWeeklyPlan(normalizeWorkoutPlannerWeeklyPlan(generatedWorkoutAdjustment.draft.updatedWeeklyPlan))
+    setAiWorkoutPlanPendingApproval(true)
+    setAiWorkoutPlanSource('adjustment')
+    setWorkoutPlanApproved(false)
   }
 
   // ── Text plan handler ────────────────────────────────────────────────────────
@@ -637,22 +1049,23 @@ export default function ClientDetailPage() {
     setAiMessageCopied(false)
 
     try {
+      const coachingInput = {
+        client: {
+          id: client.id,
+          fullName: client.full_name,
+          status: client.status,
+          joinedAt: client.created_at,
+        },
+        performanceSummary,
+        checkInAnalysis,
+      }
       const response = await fetch('/api/ai/coaching-assistant', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          input: {
-            client: {
-              id: client.id,
-              fullName: client.full_name,
-              status: client.status,
-              joinedAt: client.created_at,
-            },
-            performanceSummary,
-            checkInAnalysis,
-          },
+          input: coachingInput,
         }),
       })
 
@@ -662,9 +1075,19 @@ export default function ClientDetailPage() {
         throw new Error(payload?.error ?? 'Unable to generate AI coaching suggestions right now.')
       }
 
-      const nextSuggestion = payload as GeneratedAICoachingSuggestion
-      setAiSuggestion(nextSuggestion)
-      return nextSuggestion
+      const nextSuggestion = payload as Omit<GeneratedAICoachingSuggestion, 'historyId'>
+      const historyEntry = await storeAISuggestionHistory(
+        'coaching_assistant',
+        coachingInput as unknown as Record<string, unknown>,
+        nextSuggestion as unknown as Record<string, unknown>,
+      )
+      const nextSuggestionWithHistory = {
+        ...nextSuggestion,
+        historyId: historyEntry?.id ?? null,
+      }
+
+      setAiSuggestion(nextSuggestionWithHistory)
+      return nextSuggestionWithHistory
     } catch (generationError) {
       console.error('Error generating AI coaching suggestions:', generationError)
       setAiSuggestion(null)
@@ -685,6 +1108,7 @@ export default function ClientDetailPage() {
   async function generateCoachMessageDraft() {
     if (aiSuggestion?.suggestion.suggestedCoachMessage) {
       setCoachMessageDraft(aiSuggestion.suggestion.suggestedCoachMessage)
+      setCoachMessageWasAIDrafted(true)
       return
     }
 
@@ -692,6 +1116,7 @@ export default function ClientDetailPage() {
 
     if (generatedSuggestion?.suggestion.suggestedCoachMessage) {
       setCoachMessageDraft(generatedSuggestion.suggestion.suggestedCoachMessage)
+      setCoachMessageWasAIDrafted(true)
     }
   }
 
@@ -709,19 +1134,56 @@ export default function ClientDetailPage() {
     window.alert('Apply changes is coming next. For now, AI suggestions stay as draft guidance only and nothing will be saved automatically.')
   }
 
+  async function handleAiSuggestionApprovalChange(approved: boolean) {
+    setAiApproved(approved)
+    await updateAISuggestionHistoryApproval(aiSuggestion?.historyId ?? null, approved)
+  }
+
+  async function handleWorkoutPlanApprovalChange(approved: boolean) {
+    setWorkoutPlanApproved(approved)
+
+    if (aiWorkoutPlanSource === 'planner') {
+      await updateAISuggestionHistoryApproval(generatedWorkoutPlan?.historyId ?? null, approved)
+    } else if (aiWorkoutPlanSource === 'adjustment') {
+      await updateAISuggestionHistoryApproval(generatedWorkoutAdjustment?.historyId ?? null, approved)
+    }
+  }
+
+  async function handleWorkoutAdjustmentApprovalChange(approved: boolean) {
+    setWorkoutAdjustmentApproved(approved)
+    await updateAISuggestionHistoryApproval(generatedWorkoutAdjustment?.historyId ?? null, approved)
+  }
+
   async function sendCoachMessage() {
     if (!client || coachMessageSending) return
 
     const content = coachMessageDraft.trim()
     if (!content) return
 
+    const resolvedCoachId =
+      typeof client.coach_id === 'string' && client.coach_id
+        ? client.coach_id
+        : coachUserId
+
+    if (!resolvedCoachId) {
+      setMessagesError('We could not determine the coach ID for this message.')
+      return
+    }
+
     setCoachMessageSending(true)
     setMessagesError(null)
 
     const optimisticMessage: ClientMessage = {
+      coach_id: resolvedCoachId,
       client_id: client.id,
-      sender_type: 'coach',
+      sender: 'coach',
+      message_type: 'text',
       content,
+      media_url: null,
+      media_duration_seconds: null,
+      read: false,
+      read_at: null,
+      was_ai_drafted: coachMessageWasAIDrafted,
       created_at: new Date().toISOString(),
     }
 
@@ -730,11 +1192,18 @@ export default function ClientDetailPage() {
     const { data, error } = await supabase
       .from('messages')
       .insert({
+        coach_id: resolvedCoachId,
         client_id: client.id,
-        sender_type: 'coach',
+        sender: 'coach',
+        message_type: 'text',
         content,
+        media_url: null,
+        media_duration_seconds: null,
+        read: false,
+        read_at: null,
+        was_ai_drafted: coachMessageWasAIDrafted,
       })
-      .select('id, client_id, sender_type, content, created_at')
+      .select('id, created_at, coach_id, client_id, sender, message_type, content, media_url, media_duration_seconds, read, read_at, was_ai_drafted')
       .single()
 
     if (error) {
@@ -753,6 +1222,7 @@ export default function ClientDetailPage() {
     })
 
     setCoachMessageDraft('')
+    setCoachMessageWasAIDrafted(false)
     setCoachMessageSending(false)
   }
 
@@ -802,12 +1272,38 @@ export default function ClientDetailPage() {
     : ''
   const checkInAnalysis = buildCheckInAnalysis(client, checkInSubmissions)
   const riskConfig = riskColors[performanceSummary.risk.level]
+  const clientGoals = extractClientContextValues(client, ['goal', 'goals', 'primary_goal', 'desired_outcome'])
+  const clientNotes = extractClientContextValues(client, ['notes', 'client_notes', 'coach_notes', 'program_notes'])
+  const currentPlanHasEntries = DAYS.some((day) => weeklyPlan[day].length > 0)
   const canGenerateAICoachingSuggestions =
     !aiLoading &&
     !performanceLoading &&
     !checkInLoading &&
     !performanceError &&
     !checkInError
+  const canGenerateAIWorkoutPlan =
+    !workoutPlannerLoading &&
+    !performanceLoading &&
+    !checkInLoading &&
+    !performanceError &&
+    !checkInError
+  const canGenerateWeeklyAdjustment =
+    currentPlanHasEntries &&
+    !workoutAdjustmentLoading &&
+    !performanceLoading &&
+    !checkInLoading &&
+    !performanceError &&
+    !checkInError
+  const workoutSaveDisabled = workoutSaving || (aiWorkoutPlanPendingApproval && !workoutPlanApproved)
+  const adjustmentDecisionConfig = generatedWorkoutAdjustment
+    ? adjustmentDecisionColors[generatedWorkoutAdjustment.draft.decision]
+    : null
+  const unreadClientMessageCount = getUnreadIncomingMessageCount(messages, 'coach')
+  const latestThreadMessage = getLatestMessage(messages)
+  const latestThreadPreview = getMessagePreviewText(latestThreadMessage)
+  const latestCoachMessage = [...messages].reverse().find((message) => message.sender === 'coach') ?? null
+  const latestCoachMessageKey = latestCoachMessage ? (latestCoachMessage.id ?? latestCoachMessage.created_at) : null
+  const visibleAiHistory = aiHistory.slice(0, 6)
 
   return (
     <div style={{ padding: '24px', maxWidth: '900px' }}>
@@ -840,7 +1336,7 @@ export default function ClientDetailPage() {
         </div>
       </div>
 
-      <div style={{ background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
+      <div id="check-in-summary" style={{ ...sectionAnchorStyle, background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>
           <div>
             <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
@@ -998,7 +1494,7 @@ export default function ClientDetailPage() {
         )}
       </div>
 
-      <div style={{ background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
+      <div id="messages" style={{ ...sectionAnchorStyle, background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>
           <div>
             <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
@@ -1169,7 +1665,9 @@ export default function ClientDetailPage() {
               <input
                 type="checkbox"
                 checked={aiApproved}
-                onChange={(event) => setAiApproved(event.target.checked)}
+                onChange={(event) => {
+                  void handleAiSuggestionApprovalChange(event.target.checked)
+                }}
                 style={{ marginTop: '2px' }}
               />
               <div>
@@ -1225,14 +1723,32 @@ export default function ClientDetailPage() {
         )}
       </div>
 
-      <div style={{ background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
+      <div id="workout-planner" style={{ ...sectionAnchorStyle, background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>
           <div>
-            <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
-              Messages
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+              <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
+                Messages
+              </div>
+              {unreadClientMessageCount > 0 && (
+                <span
+                  style={{
+                    background: '#fee2e2',
+                    color: '#A32D2D',
+                    fontSize: '10px',
+                    fontWeight: 600,
+                    padding: '2px 8px',
+                    borderRadius: '999px',
+                  }}
+                >
+                  {unreadClientMessageCount} new
+                </span>
+              )}
             </div>
             <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '3px' }}>
-              Simple coach-client conversation thread. Messages send manually and appear in order.
+              {latestThreadMessage
+                ? `Latest ${latestThreadMessage.sender === 'client' ? 'from client' : 'from coach'}: ${latestThreadPreview}`
+                : 'Simple coach-client conversation thread. Messages send manually and appear in order.'}
             </div>
           </div>
           <button
@@ -1252,6 +1768,33 @@ export default function ClientDetailPage() {
             {aiLoading ? 'Generating…' : 'Generate message'}
           </button>
         </div>
+
+        {latestThreadMessage && (
+          <div
+            style={{
+              background: latestThreadMessage.sender === 'client' && !latestThreadMessage.read ? '#fff7ed' : '#f9fafb',
+              border: `0.5px solid ${latestThreadMessage.sender === 'client' && !latestThreadMessage.read ? '#fed7aa' : '#e5e7eb'}`,
+              borderRadius: '10px',
+              padding: '12px',
+              marginBottom: '12px',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', flexWrap: 'wrap', marginBottom: '4px' }}>
+              <div style={{ fontSize: '11px', fontWeight: 600, color: '#6b7280', letterSpacing: '0.04em', textTransform: 'uppercase' }}>
+                Latest message
+              </div>
+              <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+                {formatMessageTimestamp(latestThreadMessage.created_at)}
+              </div>
+            </div>
+            <div style={{ fontSize: '12px', color: '#374151', lineHeight: 1.6 }}>
+              <span style={{ fontWeight: 600, color: '#111827' }}>
+                {latestThreadMessage.sender === 'client' ? 'Client' : 'Coach'}:
+              </span>{' '}
+              {latestThreadPreview}
+            </div>
+          </div>
+        )}
 
         <div
           style={{
@@ -1273,9 +1816,9 @@ export default function ClientDetailPage() {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
               {messages.map((message, index) => {
-                const isCoach = message.sender_type === 'coach'
+                const isCoach = message.sender === 'coach'
                 const showLabel =
-                  index === 0 || messages[index - 1]?.sender_type !== message.sender_type
+                  index === 0 || messages[index - 1]?.sender !== message.sender
 
                 return (
                   <div
@@ -1294,9 +1837,9 @@ export default function ClientDetailPage() {
                     <div
                       style={{
                         maxWidth: isMobile ? '100%' : '78%',
-                        background: isCoach ? '#111827' : '#fff',
+                        background: isCoach ? '#111827' : message.read ? '#fff' : '#fff7ed',
                         color: isCoach ? '#fff' : '#374151',
-                        border: isCoach ? 'none' : '0.5px solid #e5e7eb',
+                        border: isCoach ? 'none' : `0.5px solid ${message.read ? '#e5e7eb' : '#fed7aa'}`,
                         borderRadius: '12px',
                         padding: '10px 12px',
                       }}
@@ -1312,6 +1855,12 @@ export default function ClientDetailPage() {
                         }}
                       >
                         {formatMessageTimestamp(message.created_at)}
+                        {isCoach && (message.id ?? message.created_at) === latestCoachMessageKey && (
+                          <> · {getOutgoingMessageStatusLabel(message, 'coach')}</>
+                        )}
+                        {!isCoach && !message.read && (
+                          <> · Unread</>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1398,6 +1947,499 @@ export default function ClientDetailPage() {
         </div>
       </div>
 
+      <div id="weekly-adjustment" style={{ ...sectionAnchorStyle, background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
+              AI Workout Planner
+            </div>
+            <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '3px', maxWidth: '560px', lineHeight: 1.5 }}>
+              Generate a draft weekly plan from the client&apos;s current program, adherence patterns, and check-in context. The draft fills the existing builder, but nothing saves until you approve and click Save Plan.
+            </div>
+          </div>
+          <button
+            onClick={generateAIWorkoutPlan}
+            disabled={!canGenerateAIWorkoutPlan}
+            style={{
+              background: canGenerateAIWorkoutPlan ? '#111827' : '#f3f4f6',
+              color: canGenerateAIWorkoutPlan ? '#fff' : '#9ca3af',
+              fontSize: '12px',
+              fontWeight: 500,
+              padding: '7px 14px',
+              borderRadius: '8px',
+              border: 'none',
+              cursor: canGenerateAIWorkoutPlan ? 'pointer' : 'not-allowed',
+            }}
+          >
+            {workoutPlannerLoading ? 'Generating…' : 'Generate Plan'}
+          </button>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', gap: '12px', marginBottom: '12px' }}>
+          <div style={{ minWidth: isMobile ? '100%' : '220px' }}>
+            <label style={{ display: 'block', fontSize: '10px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#9ca3af', marginBottom: '6px' }}>
+              Assistance Level
+            </label>
+            <select
+              value={workoutPlannerLevel}
+              onChange={(event) => setWorkoutPlannerLevel(event.target.value as WorkoutPlannerAssistanceLevel)}
+              style={{ ...inputBase, width: '100%', boxSizing: 'border-box', padding: '8px 10px', background: '#fff' }}
+            >
+              <option value="low">Low assistance</option>
+              <option value="medium">Medium assistance</option>
+              <option value="high">High assistance</option>
+            </select>
+          </div>
+
+          <div style={{ flex: 1, minWidth: 0, background: '#f9fafb', border: '0.5px solid #e5e7eb', borderRadius: '10px', padding: '12px' }}>
+            <div style={{ fontSize: '10px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#9ca3af', marginBottom: '6px' }}>
+              Planner Behavior
+            </div>
+            <div style={{ fontSize: '12px', color: '#374151', lineHeight: 1.6 }}>
+              {workoutPlannerLevel === 'low' && 'Low assistance focuses on workout structure and exercise direction, with lighter prescription detail.'}
+              {workoutPlannerLevel === 'medium' && 'Medium assistance suggests structure plus practical sets and reps for the main work.'}
+              {workoutPlannerLevel === 'high' && 'High assistance generates the fullest weekly draft, while still keeping the plan coach-reviewable and simple.'}
+            </div>
+          </div>
+        </div>
+
+        {workoutPlannerError && (
+          <div
+            style={{
+              background: '#fee2e2',
+              color: '#A32D2D',
+              border: '1px solid #fecaca',
+              borderRadius: '8px',
+              padding: '10px 12px',
+              fontSize: '12px',
+              marginBottom: '12px',
+            }}
+          >
+            {workoutPlannerError}
+          </div>
+        )}
+
+        {!generatedWorkoutPlan && !workoutPlannerLoading && !workoutPlannerError && (
+          <div style={{ fontSize: '12px', color: '#6b7280', lineHeight: 1.6 }}>
+            No AI workout draft yet. Generate a draft when you want help structuring the week, then review it in the builder below before saving.
+          </div>
+        )}
+
+        {generatedWorkoutPlan && (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: '10px', marginBottom: '12px' }}>
+              <div
+                style={{
+                  background: '#f9fafb',
+                  border: '0.5px solid #e5e7eb',
+                  borderRadius: '10px',
+                  padding: '12px',
+                  gridColumn: isMobile ? 'auto' : '1 / -1',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '6px', flexWrap: 'wrap' }}>
+                  <div style={{ fontSize: '12px', fontWeight: 600, color: '#111827' }}>
+                    Draft Summary
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+                    Generated {new Date(generatedWorkoutPlan.generatedAt).toLocaleString('en-US', {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                    })}
+                  </div>
+                </div>
+                <div style={{ fontSize: '12px', color: '#374151', lineHeight: 1.7 }}>
+                  {generatedWorkoutPlan.draft.summary}
+                </div>
+              </div>
+
+              <div
+                style={{
+                  background: '#f9fafb',
+                  border: '0.5px solid #e5e7eb',
+                  borderRadius: '10px',
+                  padding: '12px',
+                  gridColumn: isMobile ? 'auto' : '1 / -1',
+                }}
+              >
+                <div style={{ fontSize: '12px', fontWeight: 600, color: '#111827', marginBottom: '6px' }}>
+                  Rationale
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  {generatedWorkoutPlan.draft.rationale.map((item, index) => (
+                    <div key={`workout-rationale-${index}`} style={{ fontSize: '12px', color: '#374151', lineHeight: 1.6 }}>
+                      - {item}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {aiWorkoutPlanSource === 'planner' && (
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: '10px',
+                  background: '#fff',
+                  border: '0.5px solid #e5e7eb',
+                  borderRadius: '10px',
+                  padding: '12px',
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={workoutPlanApproved}
+                  onChange={(event) => {
+                    void handleWorkoutPlanApprovalChange(event.target.checked)
+                  }}
+                  style={{ marginTop: '2px' }}
+                />
+                <div>
+                  <div style={{ fontSize: '12px', fontWeight: 500, color: '#111827' }}>
+                    I have reviewed this AI-generated plan and approve it for this client.
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '3px', lineHeight: 1.5 }}>
+                    Save Plan stays disabled until this is checked. You can still edit any day or exercise row in the builder below before saving.
+                  </div>
+                </div>
+              </label>
+            )}
+          </>
+        )}
+      </div>
+
+      <div style={{ background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
+              Weekly Adjustment
+            </div>
+            <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '3px', maxWidth: '560px', lineHeight: 1.5 }}>
+              Adjust the current plan using recent performance, adherence, check-in context, and weight trend. Nothing applies until you approve and click Apply Changes.
+            </div>
+          </div>
+          <button
+            onClick={generateWeeklyAdjustment}
+            disabled={!canGenerateWeeklyAdjustment}
+            style={{
+              background: canGenerateWeeklyAdjustment ? '#111827' : '#f3f4f6',
+              color: canGenerateWeeklyAdjustment ? '#fff' : '#9ca3af',
+              fontSize: '12px',
+              fontWeight: 500,
+              padding: '7px 14px',
+              borderRadius: '8px',
+              border: 'none',
+              cursor: canGenerateWeeklyAdjustment ? 'pointer' : 'not-allowed',
+            }}
+          >
+            {workoutAdjustmentLoading
+              ? 'Generating…'
+              : generatedWorkoutAdjustment
+                ? 'Regenerate'
+                : 'Generate Adjustment'}
+          </button>
+        </div>
+
+        {!currentPlanHasEntries && (
+          <div
+            style={{
+              background: '#f9fafb',
+              color: '#6b7280',
+              border: '0.5px solid #e5e7eb',
+              borderRadius: '10px',
+              padding: '12px',
+              fontSize: '12px',
+              lineHeight: 1.6,
+            }}
+          >
+            Add or generate a workout plan first. Weekly Adjustment is designed to evolve an existing week, not create one from scratch.
+          </div>
+        )}
+
+        {currentPlanHasEntries && (
+          <>
+            {workoutAdjustmentError && (
+              <div
+                style={{
+                  background: '#fee2e2',
+                  color: '#A32D2D',
+                  border: '1px solid #fecaca',
+                  borderRadius: '8px',
+                  padding: '10px 12px',
+                  fontSize: '12px',
+                  marginBottom: '12px',
+                }}
+              >
+                {workoutAdjustmentError}
+              </div>
+            )}
+
+            {!generatedWorkoutAdjustment && !workoutAdjustmentLoading && !workoutAdjustmentError && (
+              <div style={{ fontSize: '12px', color: '#6b7280', lineHeight: 1.6 }}>
+                No adjustment drafted yet. Generate one when you want AI to review the existing week and suggest targeted changes instead of rebuilding the plan.
+              </div>
+            )}
+
+            {generatedWorkoutAdjustment && (
+              <>
+                <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: '10px', marginBottom: '12px' }}>
+                  <div
+                    style={{
+                      background: '#f9fafb',
+                      border: '0.5px solid #e5e7eb',
+                      borderRadius: '10px',
+                      padding: '12px',
+                      gridColumn: isMobile ? 'auto' : '1 / -1',
+                    }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '6px', flexWrap: 'wrap' }}>
+                      <div style={{ fontSize: '12px', fontWeight: 600, color: '#111827' }}>
+                        Adjustment Summary
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                        {adjustmentDecisionConfig && (
+                          <span
+                            style={{
+                              background: adjustmentDecisionConfig.bg,
+                              color: adjustmentDecisionConfig.color,
+                              border: `1px solid ${adjustmentDecisionConfig.border}`,
+                              fontSize: '11px',
+                              fontWeight: 600,
+                              padding: '4px 9px',
+                              borderRadius: '999px',
+                            }}
+                          >
+                            {adjustmentDecisionConfig.label}
+                          </span>
+                        )}
+                        <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+                          Generated {new Date(generatedWorkoutAdjustment.generatedAt).toLocaleString('en-US', {
+                            month: 'short',
+                            day: 'numeric',
+                            hour: 'numeric',
+                            minute: '2-digit',
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#374151', lineHeight: 1.7 }}>
+                      {generatedWorkoutAdjustment.draft.summary}
+                    </div>
+                  </div>
+
+                  <div style={{ background: '#f9fafb', border: '0.5px solid #e5e7eb', borderRadius: '10px', padding: '12px' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#111827', marginBottom: '6px' }}>
+                      Reasoning
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      {generatedWorkoutAdjustment.draft.reasoning.map((item, index) => (
+                        <div key={`workout-adjustment-reasoning-${index}`} style={{ fontSize: '12px', color: '#374151', lineHeight: 1.6 }}>
+                          - {item}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ background: '#f9fafb', border: '0.5px solid #e5e7eb', borderRadius: '10px', padding: '12px' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#111827', marginBottom: '6px' }}>
+                      Changes
+                    </div>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      {generatedWorkoutAdjustment.draft.adjustments.map((item, index) => (
+                        <div key={`workout-adjustment-change-${index}`} style={{ fontSize: '12px', color: '#374151', lineHeight: 1.6 }}>
+                          - {item}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <label
+                  style={{
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: '10px',
+                    background: '#fff',
+                    border: '0.5px solid #e5e7eb',
+                    borderRadius: '10px',
+                    padding: '12px',
+                    marginBottom: '12px',
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={workoutAdjustmentApproved}
+                    onChange={(event) => {
+                      void handleWorkoutAdjustmentApprovalChange(event.target.checked)
+                    }}
+                    style={{ marginTop: '2px' }}
+                  />
+                  <div>
+                    <div style={{ fontSize: '12px', fontWeight: 500, color: '#111827' }}>
+                      I have reviewed and approve these AI-generated adjustments before applying them.
+                    </div>
+                    <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '3px', lineHeight: 1.5 }}>
+                      Apply Changes only updates the builder below. Nothing is saved to the client plan until you review and click Save Plan.
+                    </div>
+                  </div>
+                </label>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                  <button
+                    onClick={generateWeeklyAdjustment}
+                    disabled={!canGenerateWeeklyAdjustment}
+                    style={{
+                      background: '#fff',
+                      color: canGenerateWeeklyAdjustment ? '#374151' : '#9ca3af',
+                      fontSize: '12px',
+                      fontWeight: 500,
+                      padding: '7px 14px',
+                      borderRadius: '8px',
+                      border: '0.5px solid #e5e7eb',
+                      cursor: canGenerateWeeklyAdjustment ? 'pointer' : 'not-allowed',
+                    }}
+                  >
+                    {workoutAdjustmentLoading ? 'Generating…' : 'Regenerate'}
+                  </button>
+                  <button
+                    onClick={applyWeeklyAdjustmentChanges}
+                    disabled={!workoutAdjustmentApproved}
+                    style={{
+                      background: workoutAdjustmentApproved ? '#111827' : '#f3f4f6',
+                      color: workoutAdjustmentApproved ? '#fff' : '#9ca3af',
+                      fontSize: '12px',
+                      fontWeight: 500,
+                      padding: '7px 14px',
+                      borderRadius: '8px',
+                      border: 'none',
+                      cursor: workoutAdjustmentApproved ? 'pointer' : 'not-allowed',
+                    }}
+                  >
+                    Apply Changes
+                  </button>
+                  <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+                    {workoutAdjustmentApproved
+                      ? 'Ready to populate the builder with the updated week.'
+                      : 'Approval is required before changes can be applied.'}
+                  </div>
+                </div>
+              </>
+            )}
+          </>
+        )}
+      </div>
+
+      <div style={{ background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' }}>
+          <div>
+            <div style={{ fontSize: '11px', fontWeight: 500, letterSpacing: '0.04em', textTransform: 'uppercase', color: '#6b7280' }}>
+              AI History
+            </div>
+            <div style={{ fontSize: '12px', color: '#9ca3af', marginTop: '3px', maxWidth: '560px', lineHeight: 1.5 }}>
+              Recent AI-generated coaching suggestions and workout drafts for this client. History is review-only and does not auto-apply anything.
+            </div>
+          </div>
+          <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+            {visibleAiHistory.length === 0 ? 'No entries yet' : `Showing ${visibleAiHistory.length} recent`}
+          </div>
+        </div>
+
+        {aiHistoryError && (
+          <div
+            style={{
+              background: '#fff7ed',
+              color: '#BA7517',
+              border: '1px solid #fed7aa',
+              borderRadius: '8px',
+              padding: '10px 12px',
+              fontSize: '12px',
+              marginBottom: '12px',
+            }}
+          >
+            {aiHistoryError}
+          </div>
+        )}
+
+        {aiHistoryLoading ? (
+          <div style={{ fontSize: '12px', color: '#9ca3af' }}>
+            Loading AI history...
+          </div>
+        ) : visibleAiHistory.length === 0 ? (
+          <div
+            style={{
+              background: '#f9fafb',
+              border: '0.5px solid #e5e7eb',
+              borderRadius: '10px',
+              padding: '12px',
+              fontSize: '12px',
+              color: '#6b7280',
+              lineHeight: 1.6,
+            }}
+          >
+            No AI history yet. Generated suggestions and workout drafts will appear here after they are created.
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+            {visibleAiHistory.map((entry) => (
+              <div
+                key={entry.id}
+                style={{
+                  background: '#f9fafb',
+                  border: '0.5px solid #e5e7eb',
+                  borderRadius: '10px',
+                  padding: '12px',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap', marginBottom: '6px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <div style={{ fontSize: '12px', fontWeight: 600, color: '#111827' }}>
+                      {getAISuggestionTypeLabel(entry.suggestion_type)}
+                    </div>
+                    <span
+                      style={{
+                        background: entry.approved ? '#dcfce7' : '#f3f4f6',
+                        color: entry.approved ? '#166534' : '#6b7280',
+                        border: `1px solid ${entry.approved ? '#86efac' : '#e5e7eb'}`,
+                        fontSize: '10px',
+                        fontWeight: 600,
+                        padding: '3px 8px',
+                        borderRadius: '999px',
+                      }}
+                    >
+                      {entry.approved ? 'Approved' : 'Awaiting Review'}
+                    </span>
+                  </div>
+                  <div style={{ fontSize: '11px', color: '#9ca3af' }}>
+                    {new Date(entry.created_at).toLocaleString('en-US', {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                    })}
+                  </div>
+                </div>
+                <div style={{ fontSize: '12px', color: '#374151', lineHeight: 1.6 }}>
+                  {getAISuggestionHistorySummary(entry)}
+                </div>
+                {entry.approved && entry.approved_at && (
+                  <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '8px' }}>
+                    Approved {new Date(entry.approved_at).toLocaleString('en-US', {
+                      month: 'short',
+                      day: 'numeric',
+                      hour: 'numeric',
+                      minute: '2-digit',
+                    })}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* ── Weekly Workout Plan ─────────────────────────────────────────────── */}
       <div style={{ background: '#fff', border: '0.5px solid #e5e7eb', borderRadius: '12px', padding: '16px 20px', marginBottom: '12px' }}>
 
@@ -1417,19 +2459,69 @@ export default function ClientDetailPage() {
             )}
             <button
               onClick={saveWorkoutPlan}
-              disabled={workoutSaving}
+              disabled={workoutSaveDisabled}
               style={{
-                background: workoutSaving ? '#f3f4f6' : '#111827',
-                color: workoutSaving ? '#9ca3af' : '#fff',
+                background: workoutSaveDisabled ? '#f3f4f6' : '#111827',
+                color: workoutSaveDisabled ? '#9ca3af' : '#fff',
                 fontSize: '12px', fontWeight: 500,
                 padding: '5px 14px', borderRadius: '8px',
-                border: 'none', cursor: workoutSaving ? 'not-allowed' : 'pointer',
+                border: 'none', cursor: workoutSaveDisabled ? 'not-allowed' : 'pointer',
               }}
             >
               {workoutSaving ? 'Saving…' : 'Save Plan'}
             </button>
           </div>
         </div>
+
+        {aiWorkoutPlanPendingApproval && !workoutPlanApproved && (
+          <div
+            style={{
+              background: '#fff7ed',
+              color: '#BA7517',
+              border: '1px solid #fed7aa',
+              borderRadius: '8px',
+              padding: '10px 12px',
+              fontSize: '12px',
+              marginBottom: '12px',
+            }}
+          >
+            {aiWorkoutPlanSource === 'adjustment'
+              ? 'These AI-adjusted changes were applied to the builder. Review the updated plan and approve it before saving.'
+              : 'This workout draft came from AI assistance. Review the plan and approve it above before saving.'}
+          </div>
+        )}
+
+        {aiWorkoutPlanPendingApproval && aiWorkoutPlanSource === 'adjustment' && (
+          <label
+            style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: '10px',
+              background: '#fff',
+              border: '0.5px solid #e5e7eb',
+              borderRadius: '10px',
+              padding: '12px',
+              marginBottom: '12px',
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={workoutPlanApproved}
+              onChange={(event) => {
+                void handleWorkoutPlanApprovalChange(event.target.checked)
+              }}
+              style={{ marginTop: '2px' }}
+            />
+            <div>
+              <div style={{ fontSize: '12px', fontWeight: 500, color: '#111827' }}>
+                I have reviewed the applied AI adjustment and approve this updated plan for saving.
+              </div>
+              <div style={{ fontSize: '11px', color: '#9ca3af', marginTop: '3px', lineHeight: 1.5 }}>
+                You can still edit any day or exercise row below before saving the final plan.
+              </div>
+            </div>
+          </label>
+        )}
 
         {/* Day cards */}
         <div
