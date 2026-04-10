@@ -45,8 +45,54 @@ const PRIORITY_THRESHOLDS = {
 
 function parseNumericRating(content: Record<string, unknown>, key: string) {
   const raw = content[key]
-  const parsed = typeof raw === 'string' ? Number.parseInt(raw, 10) : Number.NaN
-  return Number.isFinite(parsed) ? parsed : null
+
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return raw
+  }
+
+  if (typeof raw === 'string') {
+    const parsed = Number.parseInt(raw, 10)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  return null
+}
+
+function getCompactCheckInNotes(submission: CheckInSubmission | null) {
+  if (!submission) return ''
+
+  return [
+    typeof submission.content.wins_challenges === 'string' ? submission.content.wins_challenges : '',
+    typeof submission.content.text_update === 'string' ? submission.content.text_update : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+    .trim()
+}
+
+function hasNegativeCheckInText(notes: string) {
+  if (!notes) return false
+
+  return [
+    /\bstress(?:ed)?\b/i,
+    /\boverwhelm(?:ed)?\b/i,
+    /\bbusy\b/i,
+    /\bexhaust(?:ed|ing)?\b/i,
+    /\bdrained\b/i,
+    /\btired\b/i,
+    /\bmiss(?:ed|ing)?\b/i,
+    /\boff track\b/i,
+    /\bstruggl(?:e|ing)\b/i,
+    /\bhard week\b/i,
+    /\brough week\b/i,
+    /\bcan'?t\b/i,
+    /\bunmotivated\b/i,
+    /\bburn(?:ed)? out\b/i,
+  ].some((pattern) => pattern.test(notes))
+}
+
+function getUnreadClientMessageCount(messages: ClientMessage[]) {
+  return messages.filter((message) => message.sender === 'client' && !message.read).length
 }
 
 function getLatestClientActivityAt(input: {
@@ -56,7 +102,9 @@ function getLatestClientActivityAt(input: {
   messages: ClientMessage[]
 }) {
   const candidates = [
-    input.checkInSubmissions[0]?.submitted_at ?? null,
+    ...input.checkInSubmissions
+      .map((submission) => getCheckInSubmissionActivityAt(submission))
+      .filter((value): value is string => typeof value === 'string' && value.length > 0),
     ...input.workoutLogs.flatMap((entry) => [entry.completed_at, entry.updated_at, entry.created_at]),
     ...input.habitLogs.flatMap((entry) => [entry.completed_at, entry.updated_at, entry.created_at]),
     ...input.messages.map((message) => message.created_at),
@@ -65,6 +113,35 @@ function getLatestClientActivityAt(input: {
   if (candidates.length === 0) return null
 
   return [...candidates].sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? null
+}
+
+function getCheckInSubmissionActivityAt(submission: CheckInSubmission) {
+  if (submission.submitted_at) return submission.submitted_at
+
+  if (hasMeaningfulSubmissionActivity(submission)) {
+    return submission.due_date ? `${submission.due_date}T00:00:00.000Z` : null
+  }
+
+  return null
+}
+
+function hasMeaningfulSubmissionActivity(submission: CheckInSubmission) {
+  const activityKeys = [
+    'energy',
+    'stress',
+    'sleep',
+    'workout_adherence',
+    'habit_adherence',
+    'wins_challenges',
+    'text_update',
+  ] as const
+
+  return activityKeys.some((key) => {
+    const value = submission.content[key]
+
+    if (typeof value === 'string') return value.trim().length > 0
+    return value !== undefined && value !== null
+  })
 }
 
 function getDaysSince(value: string, now: Date) {
@@ -107,6 +184,14 @@ export function buildCoachAttentionItem(input: CoachAttentionInput): CoachAttent
   const now = input.now ?? new Date()
   const signals: AttentionSignal[] = []
   const latestSubmission = input.checkInSubmissions[0] ?? null
+
+  console.log('DEBUG', {
+  client: input.client.full_name,
+  latestSubmission,
+  content: latestSubmission?.content,
+})
+  const latestCheckInNotes = getCompactCheckInNotes(latestSubmission)
+  const unreadClientMessageCount = getUnreadClientMessageCount(input.messages)
   const schedule = getCheckInScheduleStatus(input.checkInSettings, latestSubmission?.submitted_at ?? null, now)
   const latestActivityAt = getLatestClientActivityAt(input)
 
@@ -176,16 +261,28 @@ export function buildCoachAttentionItem(input: CoachAttentionInput): CoachAttent
 
     if (energy !== null && energy <= 2) {
       signals.push({
+        points: 3,
+        reason: 'Client energy is very low in the latest check-in.',
+        action: 'Review check-in',
+      })
+    } else if (energy !== null && energy <= 4) {
+      signals.push({
         points: 2,
-        reason: `Latest check-in shows low energy at ${energy}/5.`,
+        reason: 'Client energy is low in the latest check-in.',
         action: 'Review check-in',
       })
     }
 
-    if (stress !== null && stress >= 4) {
+    if (stress !== null && stress >= 9) {
+      signals.push({
+        points: 3,
+        reason: 'Client reported very high stress in the latest check-in.',
+        action: 'Review check-in',
+      })
+    } else if (stress !== null && stress >= 7) {
       signals.push({
         points: 2,
-        reason: `Latest check-in shows elevated stress at ${stress}/5.`,
+        reason: 'Client reported high stress in the latest check-in.',
         action: 'Review check-in',
       })
     }
@@ -198,44 +295,86 @@ export function buildCoachAttentionItem(input: CoachAttentionInput): CoachAttent
       })
     }
 
-    if ((workoutAdherence !== null && workoutAdherence <= 2) || (habitAdherence !== null && habitAdherence <= 2)) {
+    if (workoutAdherence !== null && workoutAdherence <= 1) {
+      signals.push({
+        points: 3,
+        reason: 'Client rated workout adherence as very low in the latest check-in.',
+        action: 'Follow up on adherence',
+      })
+    } else if (workoutAdherence !== null && workoutAdherence <= 2) {
       signals.push({
         points: 2,
-        reason: 'Latest check-in adherence ratings are poor.',
+        reason: 'Client rated workout adherence as poor in the latest check-in.',
         action: 'Follow up on adherence',
       })
     }
-  }
 
-  if (latestActivityAt) {
-    const daysSinceActivity = getDaysSince(latestActivityAt, now)
-
-    if (daysSinceActivity >= 10) {
+    if (habitAdherence !== null && habitAdherence <= 1) {
       signals.push({
         points: 3,
-        reason: `No recent client activity in the last ${daysSinceActivity} days.`,
-        action: 'Send message',
+        reason: 'Client rated habit adherence as very low in the latest check-in.',
+        action: 'Follow up on adherence',
       })
-    } else if (daysSinceActivity >= 6) {
+    } else if (habitAdherence !== null && habitAdherence <= 2) {
       signals.push({
-        points: 1,
-        reason: `Client activity has been quiet for ${daysSinceActivity} days.`,
-        action: 'Send message',
+        points: 2,
+        reason: 'Client rated habit adherence as poor in the latest check-in.',
+        action: 'Follow up on adherence',
       })
     }
-  } else {
+
+    if (hasNegativeCheckInText(latestCheckInNotes)) {
+      signals.push({
+        points: 2,
+        reason: 'Latest check-in text suggests friction, stress, or missed follow-through.',
+        action: 'Review check-in',
+      })
+    }
+  }
+
+  if (unreadClientMessageCount > 0) {
     signals.push({
-      points: 2,
-      reason: 'No recent client activity has been logged yet.',
+      points: unreadClientMessageCount >= 2 ? 3 : 2,
+      reason:
+        unreadClientMessageCount === 1
+          ? 'Client has 1 unread message waiting for review.'
+          : `Client has ${unreadClientMessageCount} unread messages waiting for review.`,
       action: 'Send message',
     })
   }
+
+  if (latestActivityAt) {
+  const daysSinceActivity = getDaysSince(latestActivityAt, now)
+
+  if (daysSinceActivity >= 10) {
+    signals.push({
+      points: 3,
+      reason: `No recent client activity in the last ${daysSinceActivity} days.`,
+      action: 'Send message',
+    })
+  } else if (daysSinceActivity >= 6) {
+    signals.push({
+      points: 1,
+      reason: `Client activity has been quiet for ${daysSinceActivity} days.`,
+      action: 'Send message',
+    })
+  }
+}
+
 
   const totalScore = signals.reduce((sum, signal) => sum + signal.points, 0)
   const priority = getPriority(totalScore)
   const primarySignal = choosePrimarySignal(signals)
   const topReasons = chooseTopReasons(signals)
 
+
+  const totalPoints = signals.reduce((sum, s) => sum + s.points, 0)
+
+console.log('SCORE DEBUG', {
+  client: input.client.full_name,
+  signals,
+  totalPoints,
+})
   if (!priority || !primarySignal || topReasons.length === 0) return null
 
   return {

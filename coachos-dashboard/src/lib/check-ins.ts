@@ -217,9 +217,11 @@ export function normalizeCheckInSettings(input: unknown): CoachCheckInSettings {
 export function normalizeCheckInSubmission(input: unknown): CheckInSubmission | null {
   if (!input || typeof input !== 'object') return null
 
-  const raw = input as Partial<CheckInSubmission>
+  const raw = input as Partial<CheckInSubmission> & Record<string, unknown>
+  const content = buildNormalizedSubmissionContent(raw)
+  const submittedAt = getNormalizedSubmissionTimestamp(raw, content)
 
-  if (typeof raw.id !== 'string' || typeof raw.client_id !== 'string' || typeof raw.submitted_at !== 'string') {
+  if (typeof raw.id !== 'string' || typeof raw.client_id !== 'string' || !submittedAt) {
     return null
   }
 
@@ -228,8 +230,8 @@ export function normalizeCheckInSubmission(input: unknown): CheckInSubmission | 
     client_id: raw.client_id,
     check_in_settings_id: typeof raw.check_in_settings_id === 'string' ? raw.check_in_settings_id : null,
     due_date: typeof raw.due_date === 'string' ? raw.due_date : null,
-    submitted_at: raw.submitted_at,
-    content: raw.content && typeof raw.content === 'object' ? (raw.content as Record<string, unknown>) : {},
+    submitted_at: submittedAt,
+    content,
     field_config_snapshot: normalizeCheckInFieldConfig(raw.field_config_snapshot),
   }
 }
@@ -240,6 +242,55 @@ export function normalizeCheckInSubmissions(input: unknown): CheckInSubmission[]
   return input
     .map((entry) => normalizeCheckInSubmission(entry))
     .filter((entry): entry is CheckInSubmission => entry !== null)
+}
+
+function buildNormalizedSubmissionContent(
+  input: Partial<CheckInSubmission> & Record<string, unknown>,
+) {
+  const baseContent =
+    input.content && typeof input.content === 'object' && !Array.isArray(input.content)
+      ? { ...(input.content as Record<string, unknown>) }
+      : {}
+
+  CHECK_IN_FIELDS.forEach(({ key }) => {
+    if (baseContent[key] !== undefined) return
+
+    const value = input[key]
+    if (value !== undefined && value !== null && value !== '') {
+      baseContent[key] = value
+    }
+  })
+
+  return baseContent
+}
+
+function hasSubmissionActivityFields(content: Record<string, unknown>) {
+  return CHECK_IN_FIELDS.some(({ key }) => {
+    const value = content[key]
+
+    if (typeof value === 'string') return value.trim().length > 0
+    if (Array.isArray(value)) return value.length > 0
+    return value !== undefined && value !== null
+  })
+}
+
+function getNormalizedSubmissionTimestamp(
+  input: Partial<CheckInSubmission> & Record<string, unknown>,
+  content: Record<string, unknown>,
+) {
+  if (typeof input.submitted_at === 'string' && input.submitted_at) {
+    return input.submitted_at
+  }
+
+  if (typeof input.created_at === 'string' && input.created_at) {
+    return input.created_at
+  }
+
+  if (typeof input.due_date === 'string' && input.due_date && hasSubmissionActivityFields(content)) {
+    return `${input.due_date}T00:00:00.000Z`
+  }
+
+  return null
 }
 
 export function getCheckInIntervalWeeks(settings: CoachCheckInSettings) {

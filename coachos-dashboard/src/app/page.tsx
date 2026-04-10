@@ -2,6 +2,10 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import type {
+  AIAttentionMessageInput,
+  AIAttentionMessageSuggestion,
+} from "@/lib/ai-attention-message";
 import { supabase } from "@/lib/supabase";
 import {
   buildCoachPerformanceSummary,
@@ -21,6 +25,7 @@ import {
   createDefaultCheckInSettings,
   normalizeCheckInSettings,
   normalizeCheckInSubmissions,
+  type CheckInSubmission,
 } from "@/lib/check-ins";
 import { normalizeWorkoutPlan, normalizeHabitPlan } from "@/lib/client-dashboard";
 import { getDateDaysAgo, normalizeHabitCompletionLogs } from "@/lib/habit-completions";
@@ -39,7 +44,7 @@ import {
   type UrgencyLevel,
   type AgentType,
 } from "@/lib/mock-data";
-import { normalizeClientMessages } from "@/lib/messages";
+import { normalizeClientMessages, type ClientMessage } from "@/lib/messages";
 import { normalizeWorkoutExerciseLogs } from "@/lib/workout-logs";
 
 type DashboardClient = {
@@ -61,6 +66,41 @@ type DashboardLead = {
   budget_range: string | null;
   timeline: string | null;
   ai_brief: unknown;
+};
+
+type AttentionDraftLatestCheckIn = {
+  submittedAt: string | null;
+  energy: number | null;
+  stress: number | null;
+  sleep: number | null;
+  workoutAdherence: number | null;
+  habitAdherence: number | null;
+  winsChallenges: string | null;
+  textUpdate: string | null;
+};
+
+type AttentionDraftContext = {
+  clientId: string;
+  clientName: string;
+  reasons: string[];
+  suggestedNextAction: CoachAttentionItem["suggestedNextAction"];
+  latestCheckIn: AttentionDraftLatestCheckIn | null;
+  recentContext: string[];
+};
+
+type AttentionDraftModalState = {
+  clientId: string;
+  clientName: string;
+  draftMessage: string;
+  generatedAt: string | null;
+  loading: boolean;
+  error: string | null;
+};
+
+type AttentionDraftApiResponse = {
+  suggestion: AIAttentionMessageSuggestion;
+  generatedAt: string;
+  model: string;
 };
 
 function getGreeting() {
@@ -136,6 +176,76 @@ function getAttentionActionHref(item: CoachAttentionItem) {
   return `/clients/${item.clientId}`;
 }
 
+function parseCheckInRating(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return null;
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getCheckInTextValue(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
+function buildAttentionDraftLatestCheckIn(submission: CheckInSubmission | null): AttentionDraftLatestCheckIn | null {
+  if (!submission) return null;
+
+  return {
+    submittedAt: submission.submitted_at ?? null,
+    energy: parseCheckInRating(submission.content.energy),
+    stress: parseCheckInRating(submission.content.stress),
+    sleep: parseCheckInRating(submission.content.sleep),
+    workoutAdherence: parseCheckInRating(submission.content.workout_adherence),
+    habitAdherence: parseCheckInRating(submission.content.habit_adherence),
+    winsChallenges: getCheckInTextValue(submission.content.wins_challenges),
+    textUpdate: getCheckInTextValue(submission.content.text_update),
+  };
+}
+
+function getUnreadClientMessagesCount(messages: ClientMessage[]) {
+  return messages.filter((message) => message.sender === "client" && !message.read).length;
+}
+
+function formatAttentionDraftDate(value: string) {
+  return new Date(value).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+function buildAttentionDraftRecentContext(input: {
+  item: CoachAttentionItem;
+  latestCheckIn: AttentionDraftLatestCheckIn | null;
+  unreadClientMessages: number;
+}) {
+  const context: string[] = [];
+
+  if (input.latestCheckIn?.submittedAt) {
+    context.push(`Latest check-in was submitted on ${formatAttentionDraftDate(input.latestCheckIn.submittedAt)}.`);
+  }
+
+  if (input.unreadClientMessages === 1) {
+    context.push("There is 1 unread client message waiting for review.");
+  } else if (input.unreadClientMessages >= 2) {
+    context.push(`There are ${input.unreadClientMessages} unread client messages waiting for review.`);
+  }
+
+  input.item.reasons.forEach((reason) => {
+    const normalizedReason = reason.toLowerCase();
+    if (
+      normalizedReason.includes("activity") ||
+      normalizedReason.includes("unread message") ||
+      normalizedReason.includes("check-in overdue") ||
+      normalizedReason.includes("quiet")
+    ) {
+      context.push(reason);
+    }
+  });
+
+  return [...new Set(context)];
+}
+
 function StatusPill({ status, label }: { status: string; label: string }) {
   const s = getStatusStyle(status);
   return (
@@ -194,6 +304,8 @@ export default function HomePage() {
   const [attentionItems, setAttentionItems] = useState<CoachAttentionItem[]>([]);
   const [attentionLoading, setAttentionLoading] = useState(true);
   const [attentionError, setAttentionError] = useState<string | null>(null);
+  const [attentionDraftContexts, setAttentionDraftContexts] = useState<Record<string, AttentionDraftContext>>({});
+  const [attentionDraftModal, setAttentionDraftModal] = useState<AttentionDraftModalState | null>(null);
   const [dashboardLeads, setDashboardLeads] = useState<LeadRecord[]>([]);
   const [contentIdeas, setContentIdeas] = useState<CoachContentIdea[]>([]);
   const [contentIdeasLoading, setContentIdeasLoading] = useState(true);
@@ -247,7 +359,7 @@ export default function HomePage() {
           .select("id, client_id, frequency, due_day, custom_interval_weeks, schedule_anchor_date, public_access_token, field_config, created_at, updated_at"),
         supabase
           .from("client_check_in_submissions")
-          .select("id, client_id, check_in_settings_id, due_date, submitted_at, content, field_config_snapshot")
+          .select("*")
           .order("submitted_at", { ascending: false }),
         supabase
           .from("client_workout_exercise_logs")
@@ -284,6 +396,7 @@ export default function HomePage() {
         console.error("Error loading coach attention data:", firstError);
         setAttentionError("Unable to load the attention queue right now.");
         setAttentionItems([]);
+        setAttentionDraftContexts({});
         setAttentionLoading(false);
         setContentIdeas([]);
         setContentIdeasError("Unable to load content ideas right now.");
@@ -323,6 +436,7 @@ export default function HomePage() {
       const habitLogsByClient = new Map<string, typeof habitLogs>();
       const messagesByClient = new Map<string, typeof messages>();
       const performanceSummaries: CoachPerformanceSummary[] = [];
+      const nextAttentionDraftContexts: Record<string, AttentionDraftContext> = {};
 
       submissions.forEach((entry) => {
         const current = submissionsByClient.get(entry.client_id) ?? [];
@@ -364,8 +478,7 @@ export default function HomePage() {
             checkInSubmissions: clientSubmissions,
           });
           performanceSummaries.push(performanceSummary);
-
-          return buildCoachAttentionItem({
+          const attentionItem = buildCoachAttentionItem({
             client,
             checkInSettings: checkInSettingsByClient.get(client.id) ?? createDefaultCheckInSettings(`default-${client.id}`),
             checkInSubmissions: clientSubmissions,
@@ -374,10 +487,31 @@ export default function HomePage() {
             habitLogs: clientHabitLogs,
             messages: clientMessages,
           });
+
+          if (attentionItem) {
+            const latestCheckIn = buildAttentionDraftLatestCheckIn(clientSubmissions[0] ?? null);
+            const unreadClientMessages = getUnreadClientMessagesCount(clientMessages);
+
+            nextAttentionDraftContexts[attentionItem.clientId] = {
+              clientId: attentionItem.clientId,
+              clientName: attentionItem.clientName,
+              reasons: attentionItem.reasons,
+              suggestedNextAction: attentionItem.suggestedNextAction,
+              latestCheckIn,
+              recentContext: buildAttentionDraftRecentContext({
+                item: attentionItem,
+                latestCheckIn,
+                unreadClientMessages,
+              }),
+            };
+          }
+
+          return attentionItem;
         })
         .filter((item): item is CoachAttentionItem => item !== null);
 
       setAttentionItems(sortCoachAttentionItems(nextAttentionItems));
+      setAttentionDraftContexts(nextAttentionDraftContexts);
       setAttentionLoading(false);
 
       if (leadError) {
@@ -408,8 +542,71 @@ export default function HomePage() {
     fetchAttentionQueue();
   }, []);
 
+  async function handleDraftAttentionMessage(item: CoachAttentionItem) {
+    const context = attentionDraftContexts[item.clientId];
+
+    if (!context) return;
+
+    setAttentionDraftModal({
+      clientId: item.clientId,
+      clientName: item.clientName,
+      draftMessage: "",
+      generatedAt: null,
+      loading: true,
+      error: null,
+    });
+
+    const input: AIAttentionMessageInput = {
+      client: {
+        id: context.clientId,
+        fullName: context.clientName,
+      },
+      attention: {
+        reasons: context.reasons,
+        suggestedNextAction: context.suggestedNextAction,
+      },
+      latestCheckIn: context.latestCheckIn,
+      recentContext: context.recentContext,
+    };
+
+    try {
+      const response = await fetch("/api/ai/attention-message", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ input }),
+      });
+
+      const payload = (await response.json().catch(() => null)) as AttentionDraftApiResponse | { error?: string } | null;
+
+      if (!response.ok) {
+        throw new Error(payload && "error" in payload ? payload.error ?? "Unable to draft an AI message right now." : "Unable to draft an AI message right now.");
+      }
+
+      setAttentionDraftModal({
+        clientId: item.clientId,
+        clientName: item.clientName,
+        draftMessage: payload?.suggestion.draftMessage ?? "",
+        generatedAt: payload?.generatedAt ?? null,
+        loading: false,
+        error: null,
+      });
+    } catch (draftError) {
+      setAttentionDraftModal({
+        clientId: item.clientId,
+        clientName: item.clientName,
+        draftMessage: "",
+        generatedAt: null,
+        loading: false,
+        error: draftError instanceof Error ? draftError.message : "Unable to draft an AI message right now.",
+      });
+    }
+  }
+
   return (
-    <div style={{ padding: "24px", maxWidth: "1100px" }}>
+    <>
+      <div style={{ padding: "24px", maxWidth: "1100px" }}>
       {/* Top bar */}
       <div style={{ marginBottom: "24px" }}>
         <h1 style={{ fontSize: "20px", fontWeight: 500, color: "#111827", margin: 0 }}>
@@ -545,24 +742,49 @@ export default function HomePage() {
                         Next step: <span style={{ color: "#111827", fontWeight: 500 }}>{item.suggestedNextAction}</span>
                       </div>
                     </div>
-                    <Link
-                      href={actionHref}
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        fontSize: "12px",
-                        fontWeight: 500,
-                        color: "#7F77DD",
-                        border: "0.5px solid #e5e7eb",
-                        background: "#fff",
-                        padding: "6px 12px",
-                        borderRadius: "8px",
-                        whiteSpace: "nowrap",
-                        textDecoration: "none",
-                      }}
-                    >
-                      {actionLabel}
-                    </Link>
+                    <div style={{ display: "flex", flexDirection: "column", gap: "8px", alignItems: "stretch" }}>
+                      <Link
+                        href={actionHref}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontSize: "12px",
+                          fontWeight: 500,
+                          color: "#7F77DD",
+                          border: "0.5px solid #e5e7eb",
+                          background: "#fff",
+                          padding: "6px 12px",
+                          borderRadius: "8px",
+                          whiteSpace: "nowrap",
+                          textDecoration: "none",
+                        }}
+                      >
+                        {actionLabel}
+                      </Link>
+                      <button
+                        onClick={() => void handleDraftAttentionMessage(item)}
+                        disabled={attentionDraftModal?.loading && attentionDraftModal.clientId === item.clientId}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontSize: "12px",
+                          fontWeight: 500,
+                          color: attentionDraftModal?.loading && attentionDraftModal.clientId === item.clientId ? "#9ca3af" : "#374151",
+                          border: "0.5px solid #e5e7eb",
+                          background: "#fff",
+                          padding: "6px 12px",
+                          borderRadius: "8px",
+                          whiteSpace: "nowrap",
+                          cursor: attentionDraftModal?.loading && attentionDraftModal.clientId === item.clientId ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        {attentionDraftModal?.loading && attentionDraftModal.clientId === item.clientId
+                          ? "Drafting..."
+                          : "Draft AI message"}
+                      </button>
+                    </div>
                   </div>
                 </div>
               );
@@ -1046,6 +1268,136 @@ export default function HomePage() {
           </div>
         </div>
       </div>
-    </div>
+      </div>
+
+      {attentionDraftModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(17, 24, 39, 0.32)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: "20px",
+            zIndex: 40,
+          }}
+        >
+          <div
+            style={{
+              width: "100%",
+              maxWidth: "560px",
+              background: "#fff",
+              border: "0.5px solid #e5e7eb",
+              borderRadius: "14px",
+              boxShadow: "0 24px 60px rgba(15, 23, 42, 0.18)",
+              padding: "18px",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", marginBottom: "12px" }}>
+              <div>
+                <div style={{ fontSize: "11px", fontWeight: 500, letterSpacing: "0.04em", textTransform: "uppercase", color: "#6b7280", marginBottom: "4px" }}>
+                  AI Draft Message
+                </div>
+                <div style={{ fontSize: "16px", fontWeight: 600, color: "#111827" }}>
+                  {attentionDraftModal.clientName}
+                </div>
+                <div style={{ fontSize: "12px", color: "#6b7280", marginTop: "4px", lineHeight: 1.5 }}>
+                  Review and edit before sending. Nothing is saved or sent automatically.
+                </div>
+              </div>
+              <button
+                onClick={() => setAttentionDraftModal(null)}
+                style={{
+                  border: "0.5px solid #e5e7eb",
+                  background: "#fff",
+                  color: "#6b7280",
+                  borderRadius: "8px",
+                  padding: "6px 10px",
+                  fontSize: "12px",
+                  cursor: "pointer",
+                  height: "fit-content",
+                }}
+              >
+                Close
+              </button>
+            </div>
+
+            {attentionDraftModal.loading && (
+              <div
+                style={{
+                  background: "#f9fafb",
+                  border: "0.5px solid #e5e7eb",
+                  borderRadius: "10px",
+                  padding: "14px",
+                  fontSize: "13px",
+                  color: "#6b7280",
+                }}
+              >
+                Generating a supportive draft from the latest attention signals...
+              </div>
+            )}
+
+            {attentionDraftModal.error && !attentionDraftModal.loading && (
+              <div
+                style={{
+                  background: "#fee2e2",
+                  color: "#A32D2D",
+                  border: "1px solid #fecaca",
+                  borderRadius: "8px",
+                  padding: "10px 12px",
+                  fontSize: "12px",
+                  marginBottom: "12px",
+                }}
+              >
+                {attentionDraftModal.error}
+              </div>
+            )}
+
+            {!attentionDraftModal.loading && !attentionDraftModal.error && (
+              <>
+                <textarea
+                  value={attentionDraftModal.draftMessage}
+                  onChange={(event) =>
+                    setAttentionDraftModal((current) =>
+                      current
+                        ? {
+                            ...current,
+                            draftMessage: event.target.value,
+                          }
+                        : current,
+                    )
+                  }
+                  style={{
+                    width: "100%",
+                    minHeight: "160px",
+                    border: "0.5px solid #d1d5db",
+                    borderRadius: "10px",
+                    padding: "12px",
+                    fontSize: "13px",
+                    color: "#374151",
+                    lineHeight: 1.6,
+                    fontFamily: "inherit",
+                    resize: "vertical",
+                    outline: "none",
+                  }}
+                />
+
+                {attentionDraftModal.generatedAt && (
+                  <div style={{ fontSize: "11px", color: "#9ca3af", marginTop: "10px" }}>
+                    Draft generated {new Date(attentionDraftModal.generatedAt).toLocaleString("en-US", {
+                      month: "short",
+                      day: "numeric",
+                      hour: "numeric",
+                      minute: "2-digit",
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </>
   );
 }
